@@ -14,6 +14,7 @@ from .models import (
     FeatureQuotaStatus,
     QuotaUsagePerRequest,
 )
+from .schemas import CreditUsage, MonthlyUsage, QuotaUsageResponse
 
 
 class InsufficientQuota(Exception):
@@ -26,6 +27,10 @@ class IdempotencyConflict(Exception):
 
 class OperationConflict(Exception):
     """The claim is stale or the requested transition conflicts with final state."""
+
+
+class QuotaNotConfigured(Exception):
+    """No included allowance is configured for the organization and feature."""
 
 
 def _database_now(session: Session) -> datetime:
@@ -44,6 +49,76 @@ def _refresh_monthly_quota(session: Session, quota: FeatureQuotaMonthly) -> date
         quota.resets_on = month_start + relativedelta(months=1)
         session.flush()
     return now
+
+
+def get_quota_usage(
+    session: Session, *, org_id: int, feature: APIFeature
+) -> QuotaUsageResponse:
+    """Report current included usage and usable credits; owns a short transaction.
+
+    Lock balances in the same monthly -> credits order as admission/release. The
+    reservation aggregates use one statement snapshot; finalization only changes
+    classification, not consumption. Never lock operation rows here: settlement
+    may already hold one while waiting for the monthly lock.
+    """
+    with session.begin():
+        monthly = session.scalar(
+            select(FeatureQuotaMonthly)
+            .where(
+                FeatureQuotaMonthly.org_id == org_id,
+                FeatureQuotaMonthly.feature == feature,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if monthly is None:
+            raise QuotaNotConfigured("Quota not configured for organization and feature")
+        now = _refresh_monthly_quota(session, monthly)
+        period_start = monthly.resets_on - relativedelta(months=1)
+        credits = session.scalar(
+            select(FeatureQuotaExtra)
+            .where(FeatureQuotaExtra.org_id == org_id, FeatureQuotaExtra.feature == feature)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        monthly_reserved, credit_reserved = session.execute(
+            select(
+                func.coalesce(
+                    func.sum(QuotaUsagePerRequest.used_from_monthly).filter(
+                        QuotaUsagePerRequest.reserved_at >= period_start,
+                        QuotaUsagePerRequest.reserved_at < monthly.resets_on,
+                    ),
+                    0,
+                ),
+                func.coalesce(func.sum(QuotaUsagePerRequest.used_from_extra), 0),
+            ).where(
+                QuotaUsagePerRequest.org_id == org_id,
+                QuotaUsagePerRequest.feature == feature,
+                QuotaUsagePerRequest.status == FeatureQuotaStatus.RESERVED,
+            )
+        ).one()
+        response = QuotaUsageResponse(
+            org_id=org_id,
+            feature=feature,
+            period_start=period_start,
+            next_reset=monthly.resets_on,
+            monthly=MonthlyUsage(
+                limit=monthly.total_allocated,
+                used=monthly.units_consumed - monthly_reserved,
+                reserved=monthly_reserved,
+                available=monthly.units_remaining,
+            ),
+            credits=CreditUsage(
+                reserved=credit_reserved,
+                available=(
+                    credits.units_remaining
+                    if credits is not None and credits.expires_on > now
+                    else 0
+                ),
+                expires_on=credits.expires_on if credits is not None else None,
+            ),
+        )
+    return response
 
 
 def reserve_quota(

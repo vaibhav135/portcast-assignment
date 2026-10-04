@@ -168,7 +168,39 @@ Known-key replay returns the existing operation and does not grant fresh capacit
 
 Reset and admission share a transaction; rejected admission rolls its changes
 back too. A later admission/reporting access can refresh the row again. The usage
-endpoint is not implemented yet; it must use the same locked refresh policy.
+endpoint uses the same locked refresh policy, even before any new-month admission.
+
+### Usage endpoint
+
+```text
+GET /orgs/{org_id}/features/{feature}/usage
+```
+
+For example, `/orgs/1/features/container-tracking/usage` reports:
+
+```json
+{
+  "org_id": 1,
+  "feature": "container-tracking",
+  "period_start": "2026-10-01T00:00:00Z",
+  "next_reset": "2026-11-01T00:00:00Z",
+  "monthly": {"limit": 10, "used": 3, "reserved": 7, "available": 0},
+  "credits": {"reserved": 2, "available": 5, "expires_on": "2027-01-01T00:00:00Z"}
+}
+```
+
+This is an illustrative response, not seeded data. `monthly.used` is completed
+included usage; pending allocations are separate in `monthly.reserved`.
+`credits.reserved` includes outstanding credit holds across all periods. Missing
+or expired credits report zero available; missing credits have a null expiry.
+This does not yet account for contract/grace eligibility.
+
+Reporting locks balance rows in monthly/credit order and reads both reservation
+totals in one statement snapshot. It does not lock individual operations or change
+their states. Reads can wait on active accounting transactions; benchmark that
+cost rather than assume reporting is contention-free. HTTP 404 means no configured
+quota, 422 means an invalid feature/input, and 503 means a database access failure.
+This demo endpoint is not authenticated; production must verify organization access.
 
 ### Finalization and source-specific release
 

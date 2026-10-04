@@ -9,6 +9,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from .database import create_database_engine, get_session
+from .models import APIFeature
+from .quota import QuotaNotConfigured, get_quota_usage
+from .schemas import QuotaUsageResponse
 
 
 @asynccontextmanager
@@ -37,3 +40,18 @@ def health(session: Annotated[Session, Depends(get_session)]) -> HealthResponse:
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
     return HealthResponse(status="ok")
+
+
+@app.get("/orgs/{org_id}/features/{feature}/usage", response_model=QuotaUsageResponse)
+def quota_usage(
+    org_id: int,
+    feature: APIFeature,
+    session: Annotated[Session, Depends(get_session)],
+) -> QuotaUsageResponse:
+    # Demo interface: production integration must authenticate and scope org access.
+    try:
+        return get_quota_usage(session, org_id=org_id, feature=feature)
+    except QuotaNotConfigured as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
