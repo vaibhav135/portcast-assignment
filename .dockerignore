@@ -1,0 +1,12 @@
+.git
+.env
+.env.*
+.venv
+**/__pycache__
+**/*.pyc
+.pytest_cache
+tests
+discussion
+llm_conversation
+assignment
+TODO.md

@@ -5,9 +5,9 @@ import pytest
 from dateutil.relativedelta import relativedelta
 from sqlalchemy.orm import Session
 
-import src.quota as quota_module
-from src.models import FeatureQuotaExtra, FeatureQuotaMonthly, FeatureQuotaStatus
-from src.quota import release_reservation, reserve_quota
+import src.shared.quota as quota_module
+from src.shared.models import FeatureQuotaExtra, FeatureQuotaMonthly, FeatureQuotaStatus
+from src.shared.quota import release_reservation, reserve_quota
 
 
 @pytest.mark.parametrize(

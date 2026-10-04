@@ -5,11 +5,11 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-import src.quota as quota_module
-from src.database import get_session
-from src.main import app
-from src.models import APIFeature, FeatureQuotaExtra, FeatureQuotaMonthly, Organization
-from src.quota import finalize_reservation, get_quota_usage, reserve_quota
+import src.shared.quota as quota_module
+from src.server.main import app
+from src.shared.database import get_session
+from src.shared.models import APIFeature, FeatureQuotaExtra, FeatureQuotaMonthly, Organization
+from src.shared.quota import finalize_reservation, get_quota_usage, reserve_quota
 
 
 def test_reporting_separates_completed_units_and_both_reservation_sources(

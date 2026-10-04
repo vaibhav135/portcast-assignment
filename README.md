@@ -46,20 +46,49 @@ To intentionally delete all local database data as well:
 docker compose down -v
 ```
 
-This setup starts only the development database, not the application or recovery
-worker. No application schema is created yet.
+Compose starts only the development database. It does not start applications or
+run schema initialization/migrations. The recovery worker is not implemented yet.
 
-## FastAPI database connection
+## Separate FastAPI applications
 
 With PostgreSQL running, copy `.env.example` to `.env` if you do not already have
-one. Install the locked Python dependencies and start the API:
+one. Install the locked Python dependencies:
 
 ```sh
 uv sync --locked
-uv run fastapi dev src/main.py
 ```
 
-The API uses SQLAlchemy with the psycopg driver. The example `.env` contains:
+Start each application in its own terminal:
+
+```sh
+# Reporting server: usage + health
+uv run uvicorn src.server.main:app --host 127.0.0.1 --port 8000
+
+# Schedule consumer: schedule API + health
+uv run uvicorn src.consumer.main:app --host 127.0.0.1 --port 8001
+```
+
+Neither application imports the other. Both directly use the shared library and
+the same PostgreSQL database; quota accounting is not an HTTP service.
+
+### Source layout
+
+```text
+src/server/main.py             Reporting API and health
+src/consumer/main.py           Schedule API and health
+src/consumer/service.py        Schedule logic
+src/consumer/schemas.py        Schedule request/response models
+src/consumer/seed_demo.py       Demo provisioning
+src/shared/config.py           Configuration
+src/shared/database.py         Database connection/session setup
+src/shared/models.py           SQLAlchemy tables
+src/shared/quota.py            Quota accounting and reporting
+src/shared/schemas.py          Shared response models
+src/shared/init_db.py          Explicit schema initialization
+src/shared/migrate_operation_context.py  Additive migration
+```
+
+Both apps use SQLAlchemy with the psycopg driver. The example `.env` contains:
 
 ```dotenv
 DB_HOST=127.0.0.1
@@ -69,7 +98,7 @@ DB_USERNAME=portcast
 DB_PASSWORD=portcast_dev
 ```
 
-`src/config.py` loads the root `.env` using `python-dotenv` and validates these
+`src/shared/config.py` loads the root `.env` using `python-dotenv` and validates these
 required values with Pydantic. Existing environment variables take precedence.
 The connection URL is built centrally with SQLAlchemy's URL builder, which handles
 special characters in credentials. Passwords are masked in the configuration's
@@ -81,7 +110,8 @@ the development values. Startup verifies
 database connectivity; shutdown disposes of the connection pool. Each database
 request gets a session, but transaction commits are explicit, not automatic.
 
-Check connectivity at `http://127.0.0.1:8000/health`. It returns `{"status":"ok"}`
+Check connectivity at `http://127.0.0.1:8000/health` (server) and
+`http://127.0.0.1:8001/health` (consumer). Each returns `{"status":"ok"}`
 when the database is reachable and HTTP 503 if a running API loses database access.
 If PostgreSQL is unavailable at startup, the API fails startup instead of reporting
 readiness. FastAPI startup does not create tables or run migrations.
@@ -91,10 +121,10 @@ readiness. FastAPI startup does not create tables or run migrations.
 Create the five tables from the current logical schema explicitly:
 
 ```sh
-uv run python -m src.init_db
+uv run python -m src.shared.init_db
 ```
 
-`src/models.py` defines organizations, feature costs/lease durations, per-request
+`src/shared/models.py` defines organizations, feature costs/lease durations, per-request
 allocations, purchased-credit balances, and current-month balances. The initial
 feature enum contains `container-tracking` and `sailing-schedule`. Operation states
 are `RESERVED`, `DONE`, and `RELEASED`.
@@ -106,9 +136,10 @@ These constraints alone do not implement concurrent admission or safe recovery.
 The code must preserve `reserved_at` and use claim/version checks for transitions.
 
 This command creates missing tables; it does **not** migrate existing tables or
-update existing enum types. Schema evolution will need migrations. There is no
-seed data, contract model, or recovery worker implementation yet.
-Pydantic currently validates configuration and the health response; these table
+update existing enum types. Schema evolution needs explicit migrations; the
+operation-context extension has a small additive migration described below.
+There is no contract model or recovery worker implementation yet.
+Pydantic validates configuration and API request/response schemas; these table
 definitions use SQLAlchemy, not Pydantic API models.
 
 ## Quota reservation and settlement
@@ -120,7 +151,7 @@ uv sync --locked
 uv run pytest
 ```
 
-`src/quota.py` claims an operation key using PostgreSQL `INSERT ... ON CONFLICT
+`src/shared/quota.py` claims an operation key using PostgreSQL `INSERT ... ON CONFLICT
 DO NOTHING`. `reserve_quota(...)` then locks the monthly balance to calculate
 the allocation, consumes included units first, and conditionally acquires any
 remaining units from unexpired credits. Lock order is operation, monthly balance,
@@ -137,11 +168,13 @@ different unit count raises `IdempotencyConflict`. Replays preserve the original
 reservation time, lease, and claim version; they do not renew ownership or restart
 released work. Callers must inspect the returned status.
 
-**Current limitation:** the schema does not yet store request inputs or a
-fingerprint. Different business inputs with the same unit count cannot be detected
-here; the consumer will need that check before this is full request-level
-idempotency. Replay also depends on retaining the operation record. No key-retention
-or response-replay policy is implemented yet.
+The operation may store normalized `request_payload`; replay checks both units
+and that payload. The demo consumer supplies it, so equal-cost input changes are
+rejected too. Bare quota callers that omit it only get unit-level matching.
+Results can be persisted atomically with `DONE` for response replay. Retaining the
+operation/result is necessary for replay; automatic retention/cleanup is not yet
+implemented. Previously stored rows have null input/result fields and cannot be
+treated as completed demo requests with recoverable results.
 
 The basic tests cover reservation, rejection without side effects, replay after
 exhaustion, and conflicting unit counts. This slice assumes configured balances;
@@ -173,7 +206,11 @@ endpoint uses the same locked refresh policy, even before any new-month admissio
 ### Usage endpoint
 
 ```text
-GET /orgs/{org_id}/features/{feature}/usage
+GET http://127.0.0.1:8000/orgs/{org_id}/features/{feature}/usage
+```
+
+```sh
+curl http://127.0.0.1:8000/orgs/1/features/sailing-schedule/usage
 ```
 
 For example, `/orgs/1/features/container-tracking/usage` reports:
@@ -272,3 +309,102 @@ cover the exact UTC boundary, leap February/year transitions, skipped months,
 unchanged credits, and old-period release. Cross-process exhaustion also runs
 against an expired monthly aggregate: concurrent first requests must collectively
 receive one allowance, not one allowance per instance.
+
+## Metered demo consumer
+
+For an existing database, add the nullable operation-context columns explicitly.
+For a fresh database, `init_db` already includes them. Both commands are repeatable:
+
+```sh
+uv run python -m src.shared.init_db
+uv run python -m src.shared.migrate_operation_context
+uv run python -m src.consumer.seed_demo
+uv run uvicorn src.consumer.main:app --host 127.0.0.1 --port 8001
+```
+
+The seed command prints the demo organization ID. It provisions 500 monthly
+schedule units but does not refill an existing balance. Run seeding serially as
+a local setup command, not concurrently in every API instance.
+
+Use the printed organization ID in place of `1` below:
+
+```sh
+curl -X POST http://127.0.0.1:8001/orgs/1/schedule-searches \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: 16fc2c3e-e3d6-4e49-ad32-98bda3917c83' \
+  -d '{"routes":["SGSIN-NLRTM","SGSIN-GBFXT"]}'
+```
+
+Each route costs the configured schedule unit price (one for the demo). The batch
+is admitted all-or-nothing. The result contains explicitly fictitious sailings.
+Repeat the same key/body to recover the same saved response without another
+charge, even if the configured unit price has since changed. New operations use
+the current price. Changing relevant inputs with the same key returns 409. A new key is a
+new operation; fresh-result reuse across keys is not implemented yet.
+
+Set `demo_behavior` to `fail` or `timeout` to inject confirmed failures. These
+return 502/504 and release the hold. The timeout is an injected, safely stopped
+failure—not a real remote call whose outcome is uncertain. Replaying a released
+operation returns 409; starting new work requires a new key. Insufficient capacity
+returns 429, validation errors 422, and database errors 503. Unknown accounting
+outcomes never automatically trigger a refund.
+
+The feature computation is pure and runs outside quota transactions. Concurrent
+in-progress retries may repeat that cheap read-only computation, but terminal
+state/result accounting is serialized; completed retries do not compute again.
+This is not an exactly-once guarantee for external mutations. The completed result
+and `DONE` status commit together, making a lost HTTP response recoverable.
+
+**Charge boundary for this demo:** a valid result durably recorded with `DONE`,
+not proof the LB transmitted it. This is an explicit implementation limitation
+relative to the desired delivery-boundary policy; network delivery cannot be
+atomically coordinated with the database here. The endpoint is demo-only with
+no production organization authentication or contract enforcement.
+
+```sh
+uv run pytest tests/test_consumer.py -q
+```
+
+Consumer tests cover successful outcome/replay, equal-cost input conflict,
+confirmed failure/refund, no execution after quota/validation rejection, and
+preservation of the hold during uncertain final accounting. The migration adds
+columns without deleting rows; it is not a general migration framework.
+
+## Docker applications
+
+Build the separate images from the repository root:
+
+```sh
+docker build -f Dockerfile.server -t portcast-server .
+docker build -f Dockerfile.consumer -t portcast-consumer .
+```
+
+Both install locked dependencies with `uv`. `Dockerfile.server` copies only
+shared + server source; `Dockerfile.consumer` copies only shared + consumer source.
+Supply database credentials at runtime with `--env-file .env`; do not embed
+secrets in images.
+
+With the Compose database running and the schema/seed commands above completed,
+attach both applications to its network:
+
+```sh
+docker network ls
+docker run --network portcast-assignment_default --env-file .env -e DB_HOST=postgres -e DB_PORT=5432 -p 127.0.0.1:8000:8000 portcast-server
+docker run --network portcast-assignment_default --env-file .env -e DB_HOST=postgres -e DB_PORT=5432 -p 127.0.0.1:8001:8000 portcast-consumer
+```
+
+Run the two containers in separate terminals. The Compose network name can vary;
+use the actual name from `docker network ls`. Container-to-container database
+traffic uses `postgres:5432`, while host commands use `127.0.0.1:5433`.
+
+For Docker Desktop, containers can alternatively reach the host-published database:
+
+```sh
+docker run --env-file .env -e DB_HOST=host.docker.internal -p 127.0.0.1:8000:8000 portcast-server
+docker run --env-file .env -e DB_HOST=host.docker.internal -p 127.0.0.1:8001:8000 portcast-consumer
+```
+
+These commands use the `.env` host database port, normally 5433. With Colima,
+host routing depends on the environment; prefer the shared Compose network above.
+Compose remains database-only, and application startup does not run schema
+migrations. The schedule consumer is not a recovery worker; that worker is pending.

@@ -22,7 +22,7 @@ class InsufficientQuota(Exception):
 
 
 class IdempotencyConflict(Exception):
-    """The operation key was already used with a different unit quantity."""
+    """The operation key was already used with different units or inputs."""
 
 
 class OperationConflict(Exception):
@@ -128,6 +128,7 @@ def reserve_quota(
     feature: APIFeature,
     units: int,
     idempotency_key: UUID,
+    request_payload: dict | None = None,
 ) -> QuotaUsagePerRequest:
     """Reserve monthly allowance first, then unexpired credits, in one transaction.
 
@@ -166,6 +167,7 @@ def reserve_quota(
                 used_from_monthly=units,
                 used_from_extra=0,
                 idempotency_key=idempotency_key,
+                request_payload=request_payload,
                 reserved_at=func.clock_timestamp(),
                 lease_expires_at=func.clock_timestamp()
                 + timedelta(seconds=lease_duration),
@@ -187,6 +189,8 @@ def reserve_quota(
                 raise RuntimeError("Conflicting operation disappeared during replay")
             if existing.used_from_monthly + existing.used_from_extra != units:
                 raise IdempotencyConflict("Operation key already used with different units")
+            if existing.request_payload != request_payload:
+                raise IdempotencyConflict("Operation key already used with different inputs")
             session.expunge(existing)
             return existing
 
@@ -259,7 +263,11 @@ def reserve_quota(
 
 
 def finalize_reservation(
-    session: Session, *, operation_id: int, claim_version: int
+    session: Session,
+    *,
+    operation_id: int,
+    claim_version: int,
+    result_payload: dict | None = None,
 ) -> QuotaUsagePerRequest:
     """Record confirmed success without deducting capacity a second time."""
     return _settle_reservation(
@@ -267,6 +275,7 @@ def finalize_reservation(
         operation_id=operation_id,
         claim_version=claim_version,
         target=FeatureQuotaStatus.DONE,
+        result_payload=result_payload,
     )
 
 
@@ -288,6 +297,7 @@ def _settle_reservation(
     operation_id: int,
     claim_version: int,
     target: FeatureQuotaStatus,
+    result_payload: dict | None = None,
 ) -> QuotaUsagePerRequest:
     # Serialize competing success/failure calls on this operation. Keep the lock
     # through any compensating balance update and state change in the same commit.
@@ -352,6 +362,9 @@ def _settle_reservation(
                 credits.units_remaining += operation.used_from_extra
                 # Never extend validity: refunded expired credits remain unusable.
 
+        if target == FeatureQuotaStatus.DONE:
+            # Result and DONE commit together; a replay never overwrites this result.
+            operation.result_payload = result_payload
         operation.status = target
         session.flush()
         session.expunge(operation)

@@ -6,8 +6,8 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from src.database import create_database_engine
-from src.models import (
+from src.shared.database import create_database_engine
+from src.shared.models import (
     APIQuotaMap,
     APIFeature,
     FeatureQuotaExtra,

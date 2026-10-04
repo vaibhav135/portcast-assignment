@@ -15,6 +15,7 @@ from sqlalchemy import (
     func,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -88,6 +89,8 @@ class QuotaUsagePerRequest(Base):
     )
     claim_version: Mapped[int] = mapped_column(Integer, server_default=text("0"))
     lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    request_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    result_payload: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
 
 class FeatureQuotaExtra(Base):

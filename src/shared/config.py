@@ -27,7 +27,7 @@ class DatabaseConfig(BaseModel):
 
 def get_database_config() -> DatabaseConfig:
     # Environment values override the project's local .env configuration.
-    load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+    load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
     return DatabaseConfig.model_validate(
         {
             "host": os.environ.get("DB_HOST"),

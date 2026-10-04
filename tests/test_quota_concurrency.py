@@ -10,8 +10,8 @@ from sqlalchemy import URL, Engine, create_engine, delete, insert, select, text,
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
-from src.database import create_database_engine
-from src.models import (
+from src.shared.database import create_database_engine
+from src.shared.models import (
     APIQuotaMap,
     APIFeature,
     FeatureQuotaExtra,
@@ -20,7 +20,7 @@ from src.models import (
     Organization,
     QuotaUsagePerRequest,
 )
-from src.quota import InsufficientQuota, release_reservation, reserve_quota
+from src.shared.quota import InsufficientQuota, release_reservation, reserve_quota
 
 
 @pytest.fixture

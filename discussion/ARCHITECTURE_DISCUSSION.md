@@ -7,6 +7,29 @@
 > progress with an exhaustive series of design questions.
 > **Agreed** means an explicit decision; **proposed** means a direction still needing confirmation.
 
+## Latest author-requested deployment update
+
+The author subsequently requested separate **reporting server** and **schedule
+consumer** applications. This overrides the combined API/consumer deployment
+topology recorded below; the earlier discussion is preserved as history.
+
+- `src/server/main.py`: usage reporting + health, local port 8000.
+- `src/consumer/main.py`: schedule API + health, local port 8001. Schedule logic,
+  API models, and seeding live in `service.py`, `schemas.py`, and `seed_demo.py`.
+- `src/shared`: configuration, database, tables, quota logic, shared response
+  models, schema initialization, and the operation-context migration.
+- Neither app imports the other. Both import the shared library directly and
+  use the same PostgreSQL database. Quota is not a separate HTTP service.
+- Separate server/consumer images contain only shared source + their own app and
+  install locked dependencies with `uv`; credentials are supplied at runtime.
+- Compose remains database-only. Schema setup/migrations are explicit commands.
+  The future recovery worker is still pending and is distinct from the schedule
+  consumer; its image/deployment packaging has not been implemented.
+
+Runnable commands and Docker networking are documented in the README. This update
+does not turn historical proposals below into claims of implemented recovery or
+verified performance.
+
 ## 1. The assignment problem
 
 Build a Python 3 component that tracks and enforces monthly usage quotas for each
@@ -356,6 +379,7 @@ use polling for recovery. Do not introduce CDC or a broker for this purpose.
 The author's Kafka reference was an analogy for persistence/replay, not a proposal
 to add Kafka.
 
+**Historical deployment discussion (superseded by the update above):**
 Normal requests execute directly in API processes. A separate recovery worker
 periodically checks for pending operations with expired ownership leases, not
 every pending operation. In ECS terms, this is a separate worker service/task,
@@ -415,7 +439,8 @@ consistency guarantees, and HTTP errors remain open.
 **Agreed:** use shared PostgreSQL, running in Docker for local reproducibility.
 Application instances do not maintain authoritative per-instance balances.
 
-**Finalized integration shape:** one reusable quota module imported by the
+**Historical integration shape (deployment topology superseded above):**
+one reusable quota module imported by the
 API/consumer and the recovery worker. It is not a separate HTTP service, process,
 or third ECS task type. There are two deployable application process types:
 
@@ -446,7 +471,9 @@ requiring every edge case to be discussed before coding.
 The quota module should return structured results; the API layer translates them
 to HTTP responses. Quota accounting should not be coupled to response rendering.
 Framework, exact interfaces, runtime configuration, and packaging are still
-undecided. The two-process deployment topology is agreed.
+undecided at this discussion checkpoint. The earlier two-process topology is
+superseded by the latest author-requested server/consumer split; the recovery
+worker remains future work.
 
 A separate service can offer independent scaling and a shared integration
 boundary, but adds a network hop and additional failure handling. Server load

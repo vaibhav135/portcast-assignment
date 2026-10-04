@@ -5,13 +5,13 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from src.models import (
+from src.shared.models import (
     FeatureQuotaExtra,
     FeatureQuotaMonthly,
     FeatureQuotaStatus,
     QuotaUsagePerRequest,
 )
-from src.quota import (
+from src.shared.quota import (
     IdempotencyConflict,
     InsufficientQuota,
     OperationConflict,

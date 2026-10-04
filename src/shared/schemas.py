@@ -1,5 +1,4 @@
 from datetime import datetime
-
 from pydantic import BaseModel, Field
 
 from .models import APIFeature
@@ -25,3 +24,7 @@ class QuotaUsageResponse(BaseModel):
     next_reset: datetime
     monthly: MonthlyUsage
     credits: CreditUsage
+
+
+class HealthResponse(BaseModel):
+    status: str
