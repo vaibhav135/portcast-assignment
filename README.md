@@ -21,8 +21,8 @@ Seeding does **not** refill an existing balance.
 
 | Component | Default address |
 |---|---|
-| Schedule consumer / API docs | <http://127.0.0.1:8001/docs> |
-| Usage reporting / API docs | <http://127.0.0.1:8000/docs> |
+| Schedule consumer / API docs | `http://127.0.0.1:8001/docs` |
+| Usage reporting / API docs | `http://127.0.0.1:8000/docs` |
 | PostgreSQL | `127.0.0.1:5433` |
 | Recovery worker | Separate process; no exposed port |
 
@@ -94,15 +94,37 @@ fixture, then cleans up its rows. It simulates abandonment, not an actual proces
 
 ## Architecture at a glance
 
-- **`src/consumer/`** — schedule API, pure demo feature, separate recovery process.
-- **`src/server/`** — usage reporting and health.
-- **`src/shared/`** — PostgreSQL models, configuration, transactional quota library.
+Main runtime modules (setup and benchmark files omitted):
 
-Both apps import the library directly; neither calls a separate quota HTTP service.
-PostgreSQL is authoritative. Admission reserves capacity before work; settlement
-records success or refunds confirmed failure. The design, author-drawn diagrams,
-concurrency reasoning, reset policy, and deferred extensions are in
-**[DESIGN.md](DESIGN.md)**.
+```text
+src/
+├── consumer/
+│   ├── main.py
+│   ├── schemas.py
+│   ├── service.py
+│   └── recovery_worker.py
+├── server/
+│   └── main.py
+└── shared/
+    ├── config.py
+    ├── database.py
+    ├── models.py
+    ├── quota.py
+    └── schemas.py
+```
+
+- **Consumer:** Validates schedule-search batches and wraps the pure demo lookup
+  with quota admission and settlement. Its separate recovery worker uses persisted
+  inputs to resolve eligible abandoned reservations.
+- **Server:** Exposes usage reporting and a database-aware health check. Reports
+  completed usage, held and available capacity, and the next reset for an organization/feature.
+- **Shared:** Defines configuration, database sessions, models, and transactional
+  accounting for admission, refunds, reset, reporting, and recovery claims. Both
+  applications import it directly; PostgreSQL is authoritative, not a local counter
+  or separate quota HTTP service.
+
+For the design, author-drawn diagrams, concurrency reasoning, and deferred
+extensions, see **[DESIGN.md](DESIGN.md)**.
 
 ## Performance and scope
 
@@ -115,6 +137,21 @@ deliberate decision to avoid a late partial refactor.
 This is a local demo with a pure feature and demo identity assumptions—not production
 authentication, carrier integration, or an exactly-once external-write guarantee.
 
+## Personal learning
+
+Working with an LLM is like keeping a pot of soup or gravy on the stove: if you
+don't control the heat, it boils over. In a long coding project, that overflow
+becomes extra code, tooling, and assumptions.
+
+I experienced that here. I jumped into k6 load testing before measuring one basic
+request, then spent painful hours debugging what felt like "LLM slop soup." The
+better first step was much simpler: one request, time the transaction, understand
+the cost, then expand. k6 wasn't the wrong tool—the sequencing and scope control
+were wrong.
+
+My takeaway: **start small, verify each step, and stay in control of the LLM. Don't
+let more generated work substitute for clearer understanding.**
+
 ## Further reading
 
 - [Design decisions, measurements, scaling and limitations](DESIGN.md)
@@ -122,6 +159,3 @@ authentication, carrier integration, or an exactly-once external-write guarantee
 - [Manual transaction experiments](tests/experiments/README.md) — optional tools, not automatic tests or application dependencies.
 - [Human–AI collaboration and attribution](llm_conversation/COLLABORATION.md)
 - [Architecture discussion](discussion/ARCHITECTURE_DISCUSSION.md) — historical proposals, not the implementation contract.
-
-The previous detailed README is temporarily preserved verbatim in `temp.md` for
-review before final documentation cleanup.
