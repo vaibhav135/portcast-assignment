@@ -1,4 +1,5 @@
 from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
@@ -17,7 +18,8 @@ from src.shared.models import (
     FeatureQuotaStatus,
     QuotaUsagePerRequest,
 )
-from src.shared.quota import get_quota_usage
+from src.consumer.schemas import ScheduleSearchRequest
+from src.shared.quota import get_quota_usage, reserve_quota
 
 
 @pytest.fixture
@@ -223,3 +225,98 @@ def test_uncertain_final_accounting_does_not_refund_successful_work(
     assert usage.monthly.used == 0
     assert usage.monthly.reserved == 1
     assert usage.monthly.available == 9
+
+
+def test_lost_finalization_acknowledgement_replays_committed_result_without_refund(
+    db_session: Session,
+    schedule_quota: FeatureQuotaMonthly,
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = dict(org_id=schedule_quota.org_id, feature=schedule_quota.feature)
+    path = f"/orgs/{schedule_quota.org_id}/schedule-searches"
+    headers = {"Idempotency-Key": str(uuid4())}
+    payload = {"routes": ["SGSIN-NLRTM"]}
+    finalize = consumer_module.finalize_reservation
+    lookup = consumer_module.perform_schedule_lookup
+    calls = 0
+
+    def counted_lookup(request):
+        nonlocal calls
+        calls += 1
+        return lookup(request)
+
+    def commit_then_lose_acknowledgement(*args, **kwargs):
+        finalize(*args, **kwargs)
+        raise OperationalError("commit acknowledgement", {}, RuntimeError("simulated loss"))
+
+    monkeypatch.setattr(consumer_module, "perform_schedule_lookup", counted_lookup)
+    monkeypatch.setattr(consumer_module, "finalize_reservation", commit_then_lose_acknowledgement)
+    assert api_client.post(path, headers=headers, json=payload).status_code == 503
+    replay = api_client.post(path, headers=headers, json=payload)
+    assert replay.status_code == 200, replay.text
+    assert replay.json()["status"] == "DONE"
+    assert calls == 1
+    usage = get_quota_usage(db_session, **arguments)
+    assert (usage.monthly.used, usage.monthly.reserved, usage.monthly.available) == (1, 0, 9)
+
+
+def test_active_retry_conflicts_then_expired_retry_recovers_and_replays(
+    db_session: Session,
+    schedule_quota: FeatureQuotaMonthly,
+    api_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    arguments = dict(org_id=schedule_quota.org_id, feature=schedule_quota.feature)
+    path = f"/orgs/{schedule_quota.org_id}/schedule-searches"
+    key = uuid4()
+    headers = {"Idempotency-Key": str(key)}
+    payload = {"routes": ["SGSIN-NLRTM", "SGSIN-GBFXT"]}
+    original = reserve_quota(
+        db_session, **arguments, units=2, idempotency_key=key,
+        request_payload=ScheduleSearchRequest.model_validate(payload).model_dump(mode="json"),
+    )
+    with db_session.begin():
+        db_session.execute(update(QuotaUsagePerRequest).where(
+            QuotaUsagePerRequest.id == original.id,
+        ).values(lease_expires_at=datetime.now(timezone.utc) + timedelta(hours=1)))
+    calls = 0
+    lookup = consumer_module.perform_schedule_lookup
+
+    def counted_lookup(request):
+        nonlocal calls
+        assert not db_session.in_transaction()
+        calls += 1
+        return lookup(request)
+
+    monkeypatch.setattr(consumer_module, "perform_schedule_lookup", counted_lookup)
+    active = api_client.post(path, headers=headers, json=payload)
+    assert active.status_code == 409, active.text
+    assert calls == 0
+    usage = get_quota_usage(db_session, **arguments)
+    assert (usage.monthly.used, usage.monthly.reserved, usage.monthly.available) == (0, 2, 8)
+    with db_session.begin():
+        db_session.execute(update(QuotaUsagePerRequest).where(
+            QuotaUsagePerRequest.id == original.id,
+        ).values(lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)))
+    recovered = api_client.post(path, headers=headers, json=payload)
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["operation_id"] == original.id
+    assert recovered.json()["status"] == "DONE"
+    replay = api_client.post(path, headers=headers, json=payload)
+    assert replay.status_code == 200, replay.text
+    assert replay.json() == recovered.json()
+    assert calls == 1
+    with db_session.begin():
+        operations = db_session.scalars(select(QuotaUsagePerRequest).where(
+            QuotaUsagePerRequest.org_id == arguments["org_id"],
+            QuotaUsagePerRequest.feature == arguments["feature"],
+        )).all()
+        assert len(operations) == 1
+        row = operations[0]
+        assert row.claim_version == original.claim_version + 1
+        assert row.reserved_at == original.reserved_at
+        assert (row.used_from_monthly, row.used_from_extra) == (2, 0)
+        assert row.result_payload == {"results": recovered.json()["results"]}
+    usage = get_quota_usage(db_session, **arguments)
+    assert (usage.monthly.used, usage.monthly.reserved, usage.monthly.available) == (2, 0, 8)

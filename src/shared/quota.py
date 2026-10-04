@@ -129,6 +129,7 @@ def reserve_quota(
     units: int,
     idempotency_key: UUID,
     request_payload: dict | None = None,
+    reject_pending_replay: bool = False,
 ) -> QuotaUsagePerRequest:
     """Reserve monthly allowance first, then unexpired credits, in one transaction.
 
@@ -191,6 +192,8 @@ def reserve_quota(
                 raise IdempotencyConflict("Operation key already used with different units")
             if existing.request_payload != request_payload:
                 raise IdempotencyConflict("Operation key already used with different inputs")
+            if reject_pending_replay and existing.status == FeatureQuotaStatus.RESERVED:
+                raise OperationConflict("Operation is in progress; retry later")
             session.expunge(existing)
             return existing
 
@@ -260,6 +263,50 @@ def reserve_quota(
         session.expunge(operation)
 
     return operation
+
+
+def claim_expired_reservations(
+    session: Session,
+    *,
+    feature: APIFeature,
+    limit: int = 20,
+    operation_id: int | None = None,
+) -> list[QuotaUsagePerRequest]:
+    """Claim expired holds without spending/refunding units; owns its transaction.
+
+    SKIP LOCKED lets competing recovery processes work on different operations.
+    Expiry permits takeover, not proof of failed work. The caller must know that
+    rerunning its feature is safe and settle using the returned claim version.
+    """
+    if limit <= 0:
+        raise ValueError("Recovery batch size must be positive")
+    with session.begin():
+        query = (
+            select(QuotaUsagePerRequest, APIQuotaMap.lease_duration_sec)
+            .join(APIQuotaMap, APIQuotaMap.feature == QuotaUsagePerRequest.feature)
+            .where(
+                QuotaUsagePerRequest.feature == feature,
+                QuotaUsagePerRequest.status == FeatureQuotaStatus.RESERVED,
+                QuotaUsagePerRequest.lease_expires_at <= func.clock_timestamp(),
+            )
+            .order_by(QuotaUsagePerRequest.lease_expires_at, QuotaUsagePerRequest.id)
+            .limit(limit)
+            .with_for_update(of=QuotaUsagePerRequest, skip_locked=True)
+            .execution_options(populate_existing=True)
+        )
+        if operation_id is not None:
+            query = query.where(QuotaUsagePerRequest.id == operation_id)
+        rows = session.execute(query).all()
+        now = _database_now(session)
+        operations = []
+        for operation, lease_duration in rows:
+            operation.claim_version += 1
+            operation.lease_expires_at = now + timedelta(seconds=lease_duration)
+            operations.append(operation)
+        session.flush()
+        for operation in operations:
+            session.expunge(operation)
+    return operations
 
 
 def finalize_reservation(

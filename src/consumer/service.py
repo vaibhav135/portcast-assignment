@@ -10,6 +10,7 @@ from ..shared.quota import (
     IdempotencyConflict,
     OperationConflict,
     QuotaNotConfigured,
+    claim_expired_reservations,
     finalize_reservation,
     release_reservation,
     reserve_quota,
@@ -73,7 +74,14 @@ def search_schedules(
             )
             if unit_cost is None:
                 raise QuotaNotConfigured("Schedule-search feature is not configured")
-    if operation is None:
+    if operation is not None and operation.status == FeatureQuotaStatus.RESERVED:
+        claims = claim_expired_reservations(
+            session, feature=feature, operation_id=operation.id, limit=1
+        )
+        if not claims:
+            raise OperationConflict("Operation is in progress; retry later")
+        operation = claims[0]
+    elif operation is None:
         # This lookup is only a replay fast path. Atomic key claiming in reserve_quota
         # still protects concurrent new requests that both observed no existing row.
         operation = reserve_quota(
@@ -83,10 +91,21 @@ def search_schedules(
             units=len(request.routes) * unit_cost,
             idempotency_key=idempotency_key,
             request_payload=request_payload,
+            reject_pending_replay=True,
         )
+    return execute_schedule_operation(session, operation)
+
+
+def execute_schedule_operation(
+    session: Session, operation: QuotaUsagePerRequest
+) -> ScheduleSearchResponse:
+    """Execute admitted/claimed pure work outside transactions; never reserve again."""
+    if operation.feature != APIFeature.SAILING_SCHEDULE:
+        raise ValueError("Only the pure demo schedule feature supports recovery")
     if operation.status == FeatureQuotaStatus.RELEASED:
         raise OperationConflict("Operation was released; use a new key for new work")
     if operation.status != FeatureQuotaStatus.DONE:
+        request = ScheduleSearchRequest.model_validate(operation.request_payload)
         try:
             result = perform_schedule_lookup(request)
         except DemoFeatureFailure:

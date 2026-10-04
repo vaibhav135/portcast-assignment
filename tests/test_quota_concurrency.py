@@ -369,3 +369,98 @@ def test_concurrent_batches_cannot_overspend_combined_capacity(
             operation.used_from_monthly + operation.used_from_extra == 7
             for operation in operations
         )
+
+
+def _claim_in_process(
+    url: URL, application_name: str, operation_id: int, start_barrier,
+) -> list[tuple[int, int]]:
+    from sqlalchemy import inspect
+
+    from src.shared.quota import claim_expired_reservations
+
+    engine = create_engine(
+        url,
+        connect_args={
+            "application_name": application_name,
+            "connect_timeout": 5,
+            "options": "-c statement_timeout=5000",
+        },
+    )
+    try:
+        # Establish independent database connections before synchronizing attempts.
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        start_barrier.wait(timeout=15)
+        with Session(engine) as session:
+            claimed = claim_expired_reservations(
+                session, feature=APIFeature.CONTAINER_TRACKING,
+                limit=1, operation_id=operation_id,
+            )
+            assert not session.in_transaction()
+            assert all(inspect(operation).detached for operation in claimed)
+            return [(operation.id, operation.claim_version) for operation in claimed]
+    finally:
+        engine.dispose()
+
+
+def test_independent_claimers_skip_locked_operation_then_claim_it_only_once(
+    committed_quota: tuple[Engine, int],
+) -> None:
+    engine, org_id = committed_quota
+    with Session(engine) as session:
+        original = reserve_quota(
+            session, org_id=org_id, feature=APIFeature.CONTAINER_TRACKING,
+            units=3, idempotency_key=uuid4(),
+        )
+    with engine.begin() as connection:
+        connection.execute(update(QuotaUsagePerRequest).where(
+            QuotaUsagePerRequest.id == original.id,
+        ).values(lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=1)))
+
+    context = multiprocessing.get_context("spawn")
+    application_name = f"quota-recovery-{uuid4()}"
+    with context.Manager() as manager:
+        start_barrier = manager.Barrier(4)
+        with ProcessPoolExecutor(max_workers=4, mp_context=context) as pool:
+            with engine.connect() as blocker:
+                transaction = blocker.begin()
+                try:
+                    blocker.execute(select(QuotaUsagePerRequest.id).where(
+                        QuotaUsagePerRequest.id == original.id,
+                    ).with_for_update())
+                    futures = [pool.submit(
+                        _claim_in_process, engine.url, application_name,
+                        original.id, start_barrier,
+                    ) for _ in range(4)]
+                    # Collect while the lock is held: SKIP LOCKED must return,
+                    # not enter the observed-lock-wait gate used by reserve/release.
+                    assert [future.result(timeout=30) for future in futures] == [[], [], [], []]
+                    version = blocker.scalar(select(QuotaUsagePerRequest.claim_version).where(
+                        QuotaUsagePerRequest.id == original.id,
+                    ))
+                    assert version == original.claim_version
+                finally:
+                    transaction.rollback()
+
+            # The barrier synchronizes ready processes, not SQL lock acquisition.
+            # This verifies one committed takeover across racing independent calls.
+            futures = [pool.submit(
+                _claim_in_process, engine.url, application_name,
+                original.id, start_barrier,
+            ) for _ in range(4)]
+            outcomes = [future.result(timeout=30) for future in futures]
+            winners = [claim for outcome in outcomes for claim in outcome]
+            assert winners == [(original.id, original.claim_version + 1)]
+            assert sum(not outcome for outcome in outcomes) == 3
+
+    with Session(engine) as session:
+        row = session.get(QuotaUsagePerRequest, original.id)
+        quota = session.scalar(select(FeatureQuotaMonthly).where(
+            FeatureQuotaMonthly.org_id == org_id,
+        ))
+        assert row.status == FeatureQuotaStatus.RESERVED
+        assert row.claim_version == original.claim_version + 1
+        assert row.lease_expires_at > datetime.now(timezone.utc)
+        assert row.reserved_at == original.reserved_at
+        assert (row.used_from_monthly, row.used_from_extra) == (3, 0)
+        assert (quota.units_consumed, quota.units_remaining) == (3, 22)

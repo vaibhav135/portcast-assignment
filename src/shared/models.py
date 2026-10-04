@@ -9,6 +9,7 @@ from sqlalchemy import (
     Enum,
     ForeignKey,
     Integer,
+    Index,
     String,
     UniqueConstraint,
     Uuid,
@@ -74,6 +75,13 @@ class QuotaUsagePerRequest(Base):
             "used_from_monthly + used_from_extra > 0", name="ck_operation_positive_units"
         ),
         CheckConstraint("claim_version >= 0", name="ck_operation_claim_nonnegative"),
+        Index(
+            "ix_operation_recovery",
+            "feature",
+            "lease_expires_at",
+            "id",
+            postgresql_where=text("status = 'RESERVED'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True)

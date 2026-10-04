@@ -47,7 +47,8 @@ docker compose down -v
 ```
 
 Compose starts only the development database. It does not start applications or
-run schema initialization/migrations. The recovery worker is not implemented yet.
+run schema initialization/migrations. The recovery worker runs separately using
+the consumer package; its commands are below.
 
 ## Separate FastAPI applications
 
@@ -138,7 +139,8 @@ The code must preserve `reserved_at` and use claim/version checks for transition
 This command creates missing tables; it does **not** migrate existing tables or
 update existing enum types. Schema evolution needs explicit migrations; the
 operation-context extension has a small additive migration described below.
-There is no contract model or recovery worker implementation yet.
+There is no contract model yet. Recovery polling uses an additional partial index
+with its own explicit migration below.
 Pydantic validates configuration and API request/response schemas; these table
 definitions use SQLAlchemy, not Pydantic API models.
 
@@ -180,8 +182,8 @@ The basic tests cover reservation, rejection without side effects, replay after
 exhaustion, and conflicting unit counts. This slice assumes configured balances;
 expired monthly rows are refreshed lazily. Mixed-allocation tests verify the recorded source split,
 uncharged replay, and rollback when credits are insufficient or expired.
-Ownership recovery, cache behavior, and contract eligibility are not implemented
-yet. In particular, credit expiry is not a
+Lease-based recovery is described below; cache behavior and contract eligibility
+are not implemented yet. In particular, credit expiry is not a
 replacement for checking active-contract/grace eligibility.
 
 ### Calendar-month reset
@@ -349,9 +351,11 @@ operation returns 409; starting new work requires a new key. Insufficient capaci
 returns 429, validation errors 422, and database errors 503. Unknown accounting
 outcomes never automatically trigger a refund.
 
-The feature computation is pure and runs outside quota transactions. Concurrent
-in-progress retries may repeat that cheap read-only computation, but terminal
-state/result accounting is serialized; completed retries do not compute again.
+The feature computation is pure and runs outside quota transactions. A retry of an
+active unfinished operation returns 409 without running the lookup. After lease
+expiry, a retry may claim and recover it. An expired original executor might still
+be running, so repeated pure computation remains possible; only the current claim
+version can settle. Completed retries do not compute again.
 This is not an exactly-once guarantee for external mutations. The completed result
 and `DONE` status commit together, making a lost HTTP response recoverable.
 
@@ -407,4 +411,89 @@ docker run --env-file .env -e DB_HOST=host.docker.internal -p 127.0.0.1:8001:800
 These commands use the `.env` host database port, normally 5433. With Colima,
 host routing depends on the environment; prefer the shared Compose network above.
 Compose remains database-only, and application startup does not run schema
-migrations. The schedule consumer is not a recovery worker; that worker is pending.
+migrations. The schedule API and recovery worker are distinct processes in the
+consumer package; the worker is started explicitly, not inside each API process.
+
+## Lease recovery and separate polling worker
+
+For an existing database, add the recovery index explicitly (repeatable):
+
+```sh
+uv run python -m src.shared.migrate_recovery_index
+```
+
+Fresh schema creation includes this partial index. The development migration uses
+ordinary `CREATE INDEX`, which can block writes while building. Large production
+tables would need a separately planned concurrent index migration.
+
+Start the worker in a separate terminal/task:
+
+```sh
+uv run python -m src.consumer.recovery_worker
+
+# One bounded poll, useful for smoke checks
+uv run python -m src.consumer.recovery_worker --once
+
+# Optional tuning
+uv run python -m src.consumer.recovery_worker --poll-interval 5 --batch-size 20
+```
+
+The demo feature's lease is configured in `api_quota_map` (30 seconds in the seed).
+Polling defaults to five seconds and at most 20 claims per iteration. Polling and
+lease durations are independent; the worker waits between iterations. SIGTERM and
+SIGINT stop it after its current bounded batch and dispose the connection pool.
+Restart scanning is simply the next poll, not a per-API background thread.
+
+`claim_expired_reservations()` locks eligible `RESERVED` operations with
+`FOR UPDATE SKIP LOCKED`, increments `claim_version`, and renews the ownership
+deadline using the PostgreSQL clock. It preserves `reserved_at`, allocation, and
+balances. A bounded partial index supports polling. Claims commit before any
+feature work. Contending workers skip locked operations rather than waiting.
+
+Recognized expired client retries use the same claim primitive, scoped to their
+operation. Both retry and polling paths call `execute_schedule_operation()` with
+persisted inputs and never reserve capacity again. The consumer passes
+`reject_pending_replay=True` during admission, so concurrent first requests that
+both missed the replay lookup do not both execute an active reservation.
+
+The worker handles only `sailing-schedule`, whose fictitious lookup is pure and
+safe to repeat. It does **not** automatically replay tracking writes or arbitrary
+third-party mutations. Confirmed injected failure/timeout releases the hold;
+missing/malformed context, unknown errors, or ambiguous database commits are
+logged by operation ID, claim version, and error type without blind refunds.
+Database errors during polling are retried on a later iteration; `--once` returns
+exit status 1 if the database poll fails.
+
+**Limits:** no heartbeat, hard execution deadline, or permanent retry cap is
+implemented. Unresolved eligible demo operations can be retried after the renewed
+lease expires; legacy rows without valid inputs require operator attention. Batch
+leases start together and execution is sequential, so long work could outlive a
+lease before/during execution. That is acceptable only for this cheap pure demo;
+production features need appropriate deadlines, smaller batches/lease renewal,
+and feature-specific outcome lookup or downstream idempotency. Claim fencing
+prevents stale database settlement, not duplicate external side effects. A crash
+after computing but before persisting `DONE` may require safe recomputation.
+
+The separately deployed worker can reuse the consumer image without starting its
+HTTP app or including the server package:
+
+```sh
+docker build -f Dockerfile.consumer -t portcast-consumer .
+docker run --network portcast-assignment_default --env-file .env -e DB_HOST=postgres -e DB_PORT=5432 portcast-consumer /app/.venv/bin/python -m src.consumer.recovery_worker
+```
+
+Use your actual Compose network name. No published port is needed for the worker.
+This does not add a third source package or merge the server into the consumer.
+
+```sh
+uv run pytest tests/test_recovery.py tests/test_consumer.py tests/test_quota_concurrency.py -q
+```
+
+Tests cover abandoned durable inputs, bounded recovery, confirmed refunds,
+unknown outcomes retaining holds, active/expired retries, original allocation and
+timestamp preservation, and stale-owner rejection. Four independent processes
+verify a held operation lock is skipped and a subsequent racing takeover commits
+once. That claim test synchronizes process readiness; unlike admission tests,
+`SKIP LOCKED` does not wait for an observed row-lock contention gate. A simulated
+lost acknowledgement after finalization commits verifies saved-result replay with
+no refund or second charge; it is not an actual database/network failover test.

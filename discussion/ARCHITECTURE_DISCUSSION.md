@@ -23,8 +23,17 @@ topology recorded below; the earlier discussion is preserved as history.
 - Separate server/consumer images contain only shared source + their own app and
   install locked dependencies with `uv`; credentials are supplied at runtime.
 - Compose remains database-only. Schema setup/migrations are explicit commands.
-  The future recovery worker is still pending and is distinct from the schedule
-  consumer; its image/deployment packaging has not been implemented.
+  The recovery worker is a separate process at `src/consumer/recovery_worker.py`,
+  not the schedule HTTP app. It reuses the consumer image with a different command
+  and imports shared accounting, without including or importing server code.
+
+**Recovery implementation checkpoint:** the demo now has expired-lease claims
+with `SKIP LOCKED`, claim-version fencing, retry-driven recovery, and periodic
+polling. Polling defaults to five seconds and batches of 20; the seeded feature
+lease is 30 seconds. Only the pure schedule lookup is automatically repeatable.
+Malformed/unknown outcomes retain their holds; expiry alone never causes refunds.
+There is no heartbeat, actual execution timeout, or permanent retry cap yet.
+These are demo defaults/limits, not fulfillment of arbitrary remote-write recovery.
 
 Runnable commands and Docker networking are documented in the README. This update
 does not turn historical proposals below into claims of implemented recovery or

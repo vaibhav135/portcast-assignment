@@ -14,6 +14,9 @@ independently designed by one party. Update it as implementation progresses.
   The split and two new boundary tests passed the full suite (**35 tests**).
   The author approved the consumer and split for commit and local merge, then
   requested a new recovery branch. No push was requested.
+  Subsequently the author explicitly requested pushing `main` and starting
+  recovery; `main` was pushed. The author then reviewed and approved recovery,
+  explicitly authorizing its commit/local merge and the next runtime slice.
   Attribution documentation was explicitly requested by the author.
 
 ## 1. Collaboration agreement
@@ -153,6 +156,7 @@ has final approval or that all planned behavior is implemented.
 | Demo setup | `src/consumer/seed_demo.py`, repeatable serial provisioning without allowance refill |
 | Author-directed app split | Assistant reorganized shared/server/consumer code with no cross-app imports and separate health routes |
 | Separate app images | `Dockerfile.server` and `Dockerfile.consumer`, locked `uv` dependencies and only shared + respective app source |
+| Recovery slice | Shared expired-lease claims, `src/consumer/recovery_worker.py`, common persisted-input execution for retry/polling, and explicit partial-index migration |
 
 The assistant selected implementation details such as synchronous SQLAlchemy
 sessions, psycopg, SQLAlchemy URL construction, database constraints, explicit
@@ -181,6 +185,15 @@ human implementation decisions.
   route-boundary tests. Built both Docker images and started each app with Uvicorn
   inside its container against shared PostgreSQL; real HTTP health/OpenAPI checks
   passed. Verified each image lacks the other application's Python package.
+- Added recovery tests covering abandoned operations, bounded batches, active
+  leases, confirmed refunds, unknown/malformed context, preserved allocation,
+  stale owners, and independently racing claims. Corrected a test that incorrectly
+  compared the host clock with the authoritative PostgreSQL clock.
+- Added a simulated lost acknowledgement after successful finalization and
+  checked saved-result replay. Verified the worker entry point locally/in Docker
+  and clean SIGTERM shutdown after its first poll. The full suite including
+  recovery and the acknowledgement test passed **43 tests** against real PostgreSQL;
+  the independent-process claim test passed again in a separate run.
 
 Test runtimes are **not load-test results**. No end-to-end throughput/latency
 benchmark has been completed yet. Passing tests do not establish every production
@@ -204,6 +217,11 @@ failure guarantee.
 - The author noted the layout refactor should have been on a separate branch,
   accepted keeping it on `feat/demo-consumer`, and explicitly requested committing
   the approved work, merging to local `main`, and creating the next feature branch.
+- Created `fed2fc7`, fast-forwarded local `main`, and created `feat/quota-recovery`.
+  On the author's subsequent explicit request, pushed `main` to `origin`, including
+  reporting commit `6c8f299` and consumer/split commit `fed2fc7`. The author later
+  approved committing/merging recovery and creating `chore/demo-runtime`; no push
+  was authorized for that transition. Temporary `TODO.md` edits remain uncommitted.
 
 ## 4. Jointly refined decisions
 
@@ -230,8 +248,10 @@ These are collaborative outcomes, not exclusively human- or AI-originated:
   not exactly-once execution for a real third-party operation.
 - A saved result and accounting state support recognized replay, but do not solve
   refresh with a new key, indefinite result retention, or external uncertain outcomes.
-- Contract/grace enforcement, fresh-result reuse across keys, recovery worker,
-  one-command complete runtime, benchmarks, and final `DESIGN.md` remain unfinished.
+- Contract/grace enforcement, fresh-result reuse across keys, one-command complete
+  runtime, benchmarks, and final `DESIGN.md` remain unfinished. Recovery is limited
+  to the pure demo schedule lookup: no external-write exactly-once execution,
+  heartbeat, actual execution timeout, or permanent retry cap is implemented.
 - No real payment system, notification delivery, UI, or carrier integration was built.
 - The public company's commercial terms are context only; the exercise explicitly
   says it is not related to Portcast's actual product.
