@@ -110,3 +110,29 @@ update existing enum types. Schema evolution will need migrations. There is no
 seed data, quota execution, contract model, or recovery worker implementation yet.
 Pydantic currently validates configuration and the health response; these table
 definitions use SQLAlchemy, not Pydantic API models.
+
+## First monthly reservation slice
+
+With PostgreSQL running and the development schema initialized:
+
+```sh
+uv sync --locked
+uv run pytest
+```
+
+`src/quota.py` reserves monthly capacity using a conditional SQL update and inserts
+the `RESERVED` operation in the same transaction. An insert/commit failure rolls
+back the capacity update too. Reservation timestamps use the PostgreSQL clock;
+the returned operation is a detached snapshot. Callers must supply a session
+without an active transaction.
+
+The two initial tests cover holding capacity with an operation record and rejection
+without side effects. This slice assumes a configured, current-period balance and
+a new operation key. Credits, period resets, duplicate-key recovery, finalization,
+release, cache behavior, and contract eligibility are not implemented yet.
+
+These tests use real PostgreSQL from `.env`, with an outer transaction and
+savepoints that roll back test rows even when the function commits. Run them
+against a local development database only. They are not contention tests and do
+not establish cross-instance correctness. That verification will follow early,
+using independent connections/processes and actual committed state.

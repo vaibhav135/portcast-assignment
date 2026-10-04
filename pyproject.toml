@@ -11,3 +11,12 @@ dependencies = [
     "python-dotenv>=1.2.3",
     "sqlalchemy>=2.1.3",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
