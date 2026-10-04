@@ -221,3 +221,10 @@ assignment/
 
 # Local load fixtures and raw output; curate measured results separately.
 /benchmarks/results/
+
+# Local planning, documentation backups, and browser artifacts.
+/TODO.md
+/temp.md
+/temp-*
+/.playwright/
+/.playwright-mcp/
