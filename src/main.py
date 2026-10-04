@@ -1,0 +1,39 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+
+from fastapi import Depends, FastAPI, HTTPException
+from pydantic import BaseModel
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
+
+from .database import create_database_engine, get_session
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    engine = create_database_engine()
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        app.state.session_factory = sessionmaker(bind=engine)
+        yield
+    finally:
+        engine.dispose()
+
+
+app = FastAPI(title="Portcast quota demo", lifespan=lifespan)
+
+
+class HealthResponse(BaseModel):
+    status: str
+
+
+@app.get("/health", response_model=HealthResponse)
+def health(session: Annotated[Session, Depends(get_session)]) -> HealthResponse:
+    try:
+        session.execute(text("SELECT 1"))
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    return HealthResponse(status="ok")
