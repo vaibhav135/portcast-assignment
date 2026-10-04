@@ -7,7 +7,13 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from src.database import create_database_engine
-from src.models import APIQuotaMap, APIFeature, FeatureQuotaMonthly, Organization
+from src.models import (
+    APIQuotaMap,
+    APIFeature,
+    FeatureQuotaExtra,
+    FeatureQuotaMonthly,
+    Organization,
+)
 
 
 @pytest.fixture
@@ -54,6 +60,23 @@ def monthly_quota(db_session: Session) -> FeatureQuotaMonthly:
         units_consumed=0,
         units_remaining=10,
         resets_on=next_month,
+    )
+    db_session.add(quota)
+    db_session.commit()
+    return quota
+
+
+@pytest.fixture
+def extra_quota(
+    db_session: Session, monthly_quota: FeatureQuotaMonthly
+) -> FeatureQuotaExtra:
+    quota = FeatureQuotaExtra(
+        org_id=monthly_quota.org_id,
+        feature=monthly_quota.feature,
+        total_allocated=7,
+        units_consumed=0,
+        units_remaining=7,
+        expires_on=datetime.now(timezone.utc) + timedelta(days=90),
     )
     db_session.add(quota)
     db_session.commit()

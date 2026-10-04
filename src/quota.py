@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 from .models import (
     APIQuotaMap,
     APIFeature,
+    FeatureQuotaExtra,
     FeatureQuotaMonthly,
     FeatureQuotaStatus,
     QuotaUsagePerRequest,
@@ -26,7 +27,7 @@ class OperationConflict(Exception):
     """The claim is stale or the requested transition conflicts with final state."""
 
 
-def reserve_monthly(
+def reserve_quota(
     session: Session,
     *,
     org_id: int,
@@ -34,7 +35,7 @@ def reserve_monthly(
     units: int,
     idempotency_key: UUID,
 ) -> QuotaUsagePerRequest:
-    """Reserve monthly units and persist the operation in one short transaction.
+    """Reserve monthly allowance first, then unexpired credits, in one transaction.
 
     Assumes a configured organization/feature in the current period. Keys are
     scoped to organization and feature; same-key retries return the existing
@@ -44,7 +45,7 @@ def reserve_monthly(
     Insufficient capacity must leave both balances and operation records unchanged.
     Return a detached RESERVED operation after committing; do not execute feature
     work here. The caller must inspect its status; replay does not restart released
-    work or take over an expired lease. Credits, resets, and recovery are separate
+    work or take over an expired lease. Resets and recovery are separate
     slices. Concurrent key claiming relies on PostgreSQL READ COMMITTED isolation.
     """
     if units <= 0:
@@ -65,6 +66,8 @@ def reserve_monthly(
                 org_id=org_id,
                 feature=feature,
                 status=FeatureQuotaStatus.RESERVED,
+                # Provisional allocation claims the key. The actual split is
+                # recorded below before commit; no other transaction sees this.
                 used_from_monthly=units,
                 used_from_extra=0,
                 idempotency_key=idempotency_key,
@@ -92,23 +95,62 @@ def reserve_monthly(
             session.expunge(existing)
             return existing
 
-        acquired = session.scalar(
-            update(FeatureQuotaMonthly)
+        # Hold the monthly row while determining the split. All accounting paths
+        # acquire locks in operation -> monthly -> credits order.
+        available_monthly = session.scalar(
+            select(FeatureQuotaMonthly.units_remaining)
             .where(
                 FeatureQuotaMonthly.org_id == org_id,
                 FeatureQuotaMonthly.feature == feature,
-                FeatureQuotaMonthly.units_remaining >= units,
             )
-            .values(
-                units_consumed=FeatureQuotaMonthly.units_consumed + units,
-                units_remaining=FeatureQuotaMonthly.units_remaining - units,
-            )
-            .returning(FeatureQuotaMonthly.id)
-            .execution_options(synchronize_session=False)
+            .with_for_update()
         )
-        if acquired is None:
-            raise InsufficientQuota("Monthly quota unavailable or insufficient")
+        if available_monthly is None:
+            raise InsufficientQuota("Monthly quota is not configured")
+        monthly_units = min(available_monthly, units)
+        credit_units = units - monthly_units
 
+        if monthly_units:
+            acquired = session.scalar(
+                update(FeatureQuotaMonthly)
+                .where(
+                    FeatureQuotaMonthly.org_id == org_id,
+                    FeatureQuotaMonthly.feature == feature,
+                    FeatureQuotaMonthly.units_remaining >= monthly_units,
+                )
+                .values(
+                    units_consumed=FeatureQuotaMonthly.units_consumed + monthly_units,
+                    units_remaining=FeatureQuotaMonthly.units_remaining - monthly_units,
+                )
+                .returning(FeatureQuotaMonthly.id)
+                .execution_options(synchronize_session=False)
+            )
+            if acquired is None:
+                raise RuntimeError("Locked monthly balance changed unexpectedly")
+
+        if credit_units:
+            acquired = session.scalar(
+                update(FeatureQuotaExtra)
+                .where(
+                    FeatureQuotaExtra.org_id == org_id,
+                    FeatureQuotaExtra.feature == feature,
+                    FeatureQuotaExtra.units_remaining >= credit_units,
+                    FeatureQuotaExtra.expires_on > func.clock_timestamp(),
+                )
+                .values(
+                    units_consumed=FeatureQuotaExtra.units_consumed + credit_units,
+                    units_remaining=FeatureQuotaExtra.units_remaining - credit_units,
+                )
+                .returning(FeatureQuotaExtra.id)
+                .execution_options(synchronize_session=False)
+            )
+            if acquired is None:
+                # This exception rolls back the monthly deduction and key claim too.
+                raise InsufficientQuota("Combined allowance and usable credits are insufficient")
+
+        operation.used_from_monthly = monthly_units
+        operation.used_from_extra = credit_units
+        session.flush()
         # Keep the returned snapshot readable even with expire_on_commit=True.
         session.expunge(operation)
 
@@ -119,7 +161,7 @@ def finalize_reservation(
     session: Session, *, operation_id: int, claim_version: int
 ) -> QuotaUsagePerRequest:
     """Record confirmed success without deducting capacity a second time."""
-    return _settle_monthly(
+    return _settle_reservation(
         session,
         operation_id=operation_id,
         claim_version=claim_version,
@@ -130,8 +172,8 @@ def finalize_reservation(
 def release_reservation(
     session: Session, *, operation_id: int, claim_version: int
 ) -> QuotaUsagePerRequest:
-    """Release a confirmed failed monthly reservation once, in its original period."""
-    return _settle_monthly(
+    """Refund a confirmed failure once, preserving source periods and credit expiry."""
+    return _settle_reservation(
         session,
         operation_id=operation_id,
         claim_version=claim_version,
@@ -139,7 +181,7 @@ def release_reservation(
     )
 
 
-def _settle_monthly(
+def _settle_reservation(
     session: Session,
     *,
     operation_id: int,
@@ -164,9 +206,6 @@ def _settle_monthly(
             return operation
         if operation.status != FeatureQuotaStatus.RESERVED:
             raise OperationConflict(f"Operation is already {operation.status.value}")
-        if operation.used_from_extra:
-            raise NotImplementedError("Credit-funded settlement is not implemented yet")
-
         if target == FeatureQuotaStatus.RELEASED:
             quota = session.scalar(
                 select(FeatureQuotaMonthly)
@@ -193,6 +232,22 @@ def _settle_monthly(
             if reserved_month == current_month:
                 quota.units_consumed -= operation.used_from_monthly
                 quota.units_remaining += operation.used_from_monthly
+
+            if operation.used_from_extra:
+                credits = session.scalar(
+                    select(FeatureQuotaExtra)
+                    .where(
+                        FeatureQuotaExtra.org_id == operation.org_id,
+                        FeatureQuotaExtra.feature == operation.feature,
+                    )
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                )
+                if credits is None:
+                    raise RuntimeError("Credit accounting row is missing")
+                credits.units_consumed -= operation.used_from_extra
+                credits.units_remaining += operation.used_from_extra
+                # Never extend validity: refunded expired credits remain unusable.
 
         operation.status = target
         session.flush()

@@ -111,7 +111,7 @@ seed data, contract model, or recovery worker implementation yet.
 Pydantic currently validates configuration and the health response; these table
 definitions use SQLAlchemy, not Pydantic API models.
 
-## First monthly reservation slice
+## Quota reservation and settlement
 
 With PostgreSQL running and the development schema initialized:
 
@@ -121,8 +121,11 @@ uv run pytest
 ```
 
 `src/quota.py` claims an operation key using PostgreSQL `INSERT ... ON CONFLICT
-DO NOTHING`, then reserves monthly capacity using a conditional SQL update in
-the same transaction. Admission/commit failure rolls back both changes. A
+DO NOTHING`. `reserve_quota(...)` then locks the monthly balance to calculate
+the allocation, consumes included units first, and conditionally acquires any
+remaining units from unexpired credits. Lock order is operation, monthly balance,
+then credit balance. Admission/commit failure rolls back both sources and the
+operation claim; no partial batch is admitted. A
 concurrent duplicate waits for the original transaction and returns its existing
 operation without another deduction, even if the balance is now exhausted.
 Reservation timestamps use the PostgreSQL clock; returned operations are detached
@@ -142,14 +145,17 @@ or response-replay policy is implemented yet.
 
 The basic tests cover reservation, rejection without side effects, replay after
 exhaustion, and conflicting unit counts. This slice assumes configured,
-current-period balances. Credits, automatic period resets, ownership recovery,
-cache behavior, and contract eligibility are not implemented yet.
+current-period balances. Mixed-allocation tests verify the recorded source split,
+uncharged replay, and rollback when credits are insufficient or expired.
+Automatic period resets, ownership recovery, cache behavior, and contract
+eligibility are not implemented yet. In particular, credit expiry is not a
+replacement for checking active-contract/grace eligibility.
 
-### Monthly finalization and release
+### Finalization and source-specific release
 
 `finalize_reservation(session, operation_id=..., claim_version=...)` marks confirmed
 success as `DONE` without another deduction. `release_reservation(...)` marks a
-confirmed failure `RELEASED` and refunds its monthly allocation once. Both own a
+confirmed failure `RELEASED` and refunds its monthly and credit allocation once. Both own a
 short transaction and lock the operation row while checking its claim version
 and state. Repeating the same transition is harmless; an opposite terminal
 transition or stale claim raises `OperationConflict`.
@@ -159,10 +165,18 @@ Release locks the current monthly balance row too, refunding only when its
 operation is closed without adding capacity to a newer month. The monthly reset
 implementation must update that boundary atomically with its counters.
 
+Purchased credits are restored to their own balance, including after a monthly
+reset. Release never extends `expires_on`; an expired balance may show refunded
+units but those units remain unavailable for new admissions. Credit balance rows
+must be retained while unresolved reservations refer to them. The upcoming
+contract/credit-lifecycle code must coordinate expiration, replacement, and renewal
+with outstanding holds; this slice does not implement those lifecycle transitions.
+
 Settlement takes a confirmed outcome from the consumer; it does not decide that
 a timeout or expired lease means failure. Only claim version, not elapsed lease
-time alone, identifies changed ownership. Credit-funded settlement is explicitly
-unsupported in this slice. Internal operation IDs are not authorization: a future
+time alone, identifies changed ownership. Finalization supports monthly-only,
+mixed, and credit-only allocations without changing either balance again.
+Internal operation IDs are not authorization: a future
 API layer must verify organization access before calling settlement.
 
 The basic tests use real PostgreSQL from `.env`, with an outer transaction and
@@ -175,21 +189,27 @@ are observed waiting on a PostgreSQL lock, then releases them. Forty one-unit
 requests compete for 25 units: exactly 25 must be accepted, 15 rejected, zero
 remain, and persisted reservations must match the accounting. Unexpected database
 errors fail the test rather than being counted as quota rejections. A second
-cross-process test sends 40 copies of one key requiring all 25 available units:
+cross-process test sends 40 copies of one key requiring all available units:
 every caller must receive the same operation, with only one deduction and one
-persisted reservation. Committed fixture rows are explicitly cleaned up afterward.
+persisted reservation. It runs for monthly-only and mixed allocations. Committed
+fixture rows are explicitly cleaned up afterward.
 
 A third cross-process test releases one reservation from four processes at once,
 after observing lock contention. All receive `RELEASED`, but the balance is
-refunded exactly once. Basic transition tests cover repeat calls, incompatible
-terminal transitions, stale claims, and release after a simulated monthly reset.
+refunded exactly once for monthly-only and mixed allocations. Basic transition
+tests cover repeat calls, incompatible terminal transitions, stale claims, release
+after a simulated monthly reset, and credit-only refunds after expiry.
+
+A fourth cross-process test runs 40 batches of seven against 25 included units
+and 10 purchased credits: exactly five complete batches consume all 35 units,
+35 batches are rejected, and allocation records match both balances.
 
 ```sh
 uv run pytest tests/test_quota_concurrency.py -q
 ```
 
 This requires visibility of the test connections in `pg_stat_activity` (the local
-Compose database user supports it). It exercises monthly admission under real
+Compose database user supports it). It exercises quota admission under real
 cross-process contention, not completed downstream work, failover, or load-test
 latency. Shared development feature configuration should not be changed while
 running this test; it is not intended for a production database.

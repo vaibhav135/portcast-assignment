@@ -14,12 +14,13 @@ from src.database import create_database_engine
 from src.models import (
     APIQuotaMap,
     APIFeature,
+    FeatureQuotaExtra,
     FeatureQuotaMonthly,
     FeatureQuotaStatus,
     Organization,
     QuotaUsagePerRequest,
 )
-from src.quota import InsufficientQuota, release_reservation, reserve_monthly
+from src.quota import InsufficientQuota, release_reservation, reserve_quota
 
 
 @pytest.fixture
@@ -70,6 +71,9 @@ def committed_quota() -> Iterator[tuple[Engine, int]]:
                 connection.execute(
                     delete(FeatureQuotaMonthly).where(FeatureQuotaMonthly.org_id == org_id)
                 )
+                connection.execute(
+                    delete(FeatureQuotaExtra).where(FeatureQuotaExtra.org_id == org_id)
+                )
                 connection.execute(delete(Organization).where(Organization.id == org_id))
             if config_id is not None:
                 connection.execute(delete(APIQuotaMap).where(APIQuotaMap.id == config_id))
@@ -98,7 +102,7 @@ def _reserve_in_process(
         for _ in range(10):
             with Session(engine) as session:
                 try:
-                    operation = reserve_monthly(
+                    operation = reserve_quota(
                         session,
                         org_id=org_id,
                         feature=APIFeature.CONTAINER_TRACKING,
@@ -191,11 +195,27 @@ def test_independent_processes_cannot_overspend(
         assert sum(operation.used_from_extra for operation in operations) == 0
 
 
+@pytest.mark.parametrize("credit_funded", [False, True], ids=["monthly", "mixed"])
 def test_concurrent_duplicates_reserve_only_once(
     committed_quota: tuple[Engine, int],
+    credit_funded: bool,
 ) -> None:
     engine, org_id = committed_quota
-    outcomes = _run_contending_reservations(engine, org_id, units=25, key=uuid4())
+    if credit_funded:
+        with engine.begin() as connection:
+            connection.execute(
+                insert(FeatureQuotaExtra).values(
+                    org_id=org_id,
+                    feature=APIFeature.CONTAINER_TRACKING,
+                    total_allocated=10,
+                    units_consumed=0,
+                    units_remaining=10,
+                    expires_on=datetime.now(timezone.utc) + timedelta(days=90),
+                )
+            )
+    outcomes = _run_contending_reservations(
+        engine, org_id, units=35 if credit_funded else 25, key=uuid4()
+    )
 
     operation_ids = [operation_id for ids, _ in outcomes for operation_id in ids]
     assert len(operation_ids) == 40
@@ -208,13 +228,20 @@ def test_concurrent_duplicates_reserve_only_once(
         assert quota is not None
         assert quota.units_consumed == 25
         assert quota.units_remaining == 0
+        if credit_funded:
+            credits = session.scalar(
+                select(FeatureQuotaExtra).where(FeatureQuotaExtra.org_id == org_id)
+            )
+            assert credits is not None
+            assert credits.units_consumed == 10
+            assert credits.units_remaining == 0
         operations = session.scalars(
             select(QuotaUsagePerRequest).where(QuotaUsagePerRequest.org_id == org_id)
         ).all()
         assert len(operations) == 1
         assert operations[0].id == operation_ids[0]
         assert operations[0].used_from_monthly == 25
-        assert operations[0].used_from_extra == 0
+        assert operations[0].used_from_extra == (10 if credit_funded else 0)
 
 
 def _release_in_process(url: URL, application_name: str, operation_id: int) -> str:
@@ -236,16 +263,30 @@ def _release_in_process(url: URL, application_name: str, operation_id: int) -> s
         engine.dispose()
 
 
+@pytest.mark.parametrize("credit_funded", [False, True], ids=["monthly", "mixed"])
 def test_concurrent_release_refunds_only_once(
     committed_quota: tuple[Engine, int],
+    credit_funded: bool,
 ) -> None:
     engine, org_id = committed_quota
+    if credit_funded:
+        with engine.begin() as connection:
+            connection.execute(
+                insert(FeatureQuotaExtra).values(
+                    org_id=org_id,
+                    feature=APIFeature.CONTAINER_TRACKING,
+                    total_allocated=10,
+                    units_consumed=0,
+                    units_remaining=10,
+                    expires_on=datetime.now(timezone.utc) + timedelta(days=90),
+                )
+            )
     with Session(engine) as session:
-        operation = reserve_monthly(
+        operation = reserve_quota(
             session,
             org_id=org_id,
             feature=APIFeature.CONTAINER_TRACKING,
-            units=25,
+            units=35 if credit_funded else 25,
             idempotency_key=uuid4(),
         )
     outcomes = _run_contending_calls(
@@ -262,4 +303,54 @@ def test_concurrent_release_refunds_only_once(
         assert quota is not None
         assert quota.units_consumed == 0
         assert quota.units_remaining == 25
+        if credit_funded:
+            credits = session.scalar(
+                select(FeatureQuotaExtra).where(FeatureQuotaExtra.org_id == org_id)
+            )
+            assert credits is not None
+            assert credits.units_consumed == 0
+            assert credits.units_remaining == 10
         assert session.get(QuotaUsagePerRequest, operation.id).status == FeatureQuotaStatus.RELEASED
+
+
+def test_concurrent_batches_cannot_overspend_combined_capacity(
+    committed_quota: tuple[Engine, int],
+) -> None:
+    engine, org_id = committed_quota
+    with engine.begin() as connection:
+        connection.execute(
+            insert(FeatureQuotaExtra).values(
+                org_id=org_id,
+                feature=APIFeature.CONTAINER_TRACKING,
+                total_allocated=10,
+                units_consumed=0,
+                units_remaining=10,
+                expires_on=datetime.now(timezone.utc) + timedelta(days=90),
+            )
+        )
+    # 25 included + 10 credits = five complete batches of seven, never partial work.
+    outcomes = _run_contending_reservations(engine, org_id, units=7)
+    assert sum(len(ids) for ids, _ in outcomes) == 5
+    assert sum(rejected for _, rejected in outcomes) == 35
+    with Session(engine) as session:
+        monthly = session.scalar(
+            select(FeatureQuotaMonthly).where(FeatureQuotaMonthly.org_id == org_id)
+        )
+        credits = session.scalar(
+            select(FeatureQuotaExtra).where(FeatureQuotaExtra.org_id == org_id)
+        )
+        assert monthly is not None and credits is not None
+        assert monthly.units_consumed == 25
+        assert monthly.units_remaining == 0
+        assert credits.units_consumed == 10
+        assert credits.units_remaining == 0
+        operations = session.scalars(
+            select(QuotaUsagePerRequest).where(QuotaUsagePerRequest.org_id == org_id)
+        ).all()
+        assert len(operations) == 5
+        assert sum(operation.used_from_monthly for operation in operations) == 25
+        assert sum(operation.used_from_extra for operation in operations) == 10
+        assert all(
+            operation.used_from_monthly + operation.used_from_extra == 7
+            for operation in operations
+        )

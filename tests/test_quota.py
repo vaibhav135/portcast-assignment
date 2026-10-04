@@ -5,14 +5,19 @@ import pytest
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from src.models import FeatureQuotaMonthly, FeatureQuotaStatus, QuotaUsagePerRequest
+from src.models import (
+    FeatureQuotaExtra,
+    FeatureQuotaMonthly,
+    FeatureQuotaStatus,
+    QuotaUsagePerRequest,
+)
 from src.quota import (
     IdempotencyConflict,
     InsufficientQuota,
     OperationConflict,
     finalize_reservation,
     release_reservation,
-    reserve_monthly,
+    reserve_quota,
 )
 
 
@@ -20,7 +25,7 @@ def test_reservation_holds_units_and_records_operation(
     db_session: Session, monthly_quota: FeatureQuotaMonthly
 ) -> None:
     key = uuid4()
-    operation = reserve_monthly(
+    operation = reserve_quota(
         db_session,
         org_id=monthly_quota.org_id,
         feature=monthly_quota.feature,
@@ -51,7 +56,7 @@ def test_insufficient_quota_changes_nothing(
     db_session: Session, monthly_quota: FeatureQuotaMonthly
 ) -> None:
     with pytest.raises(InsufficientQuota):
-        reserve_monthly(
+        reserve_quota(
             db_session,
             org_id=monthly_quota.org_id,
             feature=monthly_quota.feature,
@@ -80,8 +85,8 @@ def test_retry_reuses_reservation_even_when_quota_is_exhausted(
         units=10,
         idempotency_key=key,
     )
-    original = reserve_monthly(db_session, **arguments)
-    repeated = reserve_monthly(db_session, **arguments)
+    original = reserve_quota(db_session, **arguments)
+    repeated = reserve_quota(db_session, **arguments)
 
     assert repeated.id == original.id
     assert repeated.reserved_at == original.reserved_at
@@ -107,9 +112,9 @@ def test_same_key_with_different_units_is_rejected_without_changes(
         feature=monthly_quota.feature,
         idempotency_key=key,
     )
-    original = reserve_monthly(db_session, units=3, **arguments)
+    original = reserve_quota(db_session, units=3, **arguments)
     with pytest.raises(IdempotencyConflict):
-        reserve_monthly(db_session, units=4, **arguments)
+        reserve_quota(db_session, units=4, **arguments)
 
     db_session.refresh(monthly_quota)
     assert monthly_quota.units_consumed == 3
@@ -121,26 +126,27 @@ def test_same_key_with_different_units_is_rejected_without_changes(
 
 
 @pytest.mark.parametrize(
-    "settle, expected_status, consumed, remaining, opposite",
+    "settle, expected_status, opposite",
     [
-        (finalize_reservation, FeatureQuotaStatus.DONE, 3, 7, release_reservation),
-        (release_reservation, FeatureQuotaStatus.RELEASED, 0, 10, finalize_reservation),
+        (finalize_reservation, FeatureQuotaStatus.DONE, release_reservation),
+        (release_reservation, FeatureQuotaStatus.RELEASED, finalize_reservation),
     ],
 )
+@pytest.mark.parametrize("units", [3, 13], ids=["monthly", "mixed"])
 def test_settlement_is_repeatable_but_cannot_change_terminal_state(
     db_session: Session,
     monthly_quota: FeatureQuotaMonthly,
+    extra_quota: FeatureQuotaExtra,
     settle,
     expected_status: FeatureQuotaStatus,
-    consumed: int,
-    remaining: int,
     opposite,
+    units: int,
 ) -> None:
-    operation = reserve_monthly(
+    operation = reserve_quota(
         db_session,
         org_id=monthly_quota.org_id,
         feature=monthly_quota.feature,
-        units=3,
+        units=units,
         idempotency_key=uuid4(),
     )
     arguments = dict(operation_id=operation.id, claim_version=operation.claim_version)
@@ -151,15 +157,21 @@ def test_settlement_is_repeatable_but_cannot_change_terminal_state(
     with pytest.raises(OperationConflict):
         opposite(db_session, **arguments)
     db_session.refresh(monthly_quota)
-    assert monthly_quota.units_consumed == consumed
-    assert monthly_quota.units_remaining == remaining
+    db_session.refresh(extra_quota)
+    finalized = expected_status == FeatureQuotaStatus.DONE
+    monthly_consumed = min(units, 10) if finalized else 0
+    credit_consumed = max(units - 10, 0) if finalized else 0
+    assert monthly_quota.units_consumed == monthly_consumed
+    assert monthly_quota.units_remaining == 10 - monthly_consumed
+    assert extra_quota.units_consumed == credit_consumed
+    assert extra_quota.units_remaining == 7 - credit_consumed
     assert db_session.get(QuotaUsagePerRequest, operation.id).status == expected_status
 
 
 def test_stale_claim_cannot_finalize_or_release(
     db_session: Session, monthly_quota: FeatureQuotaMonthly
 ) -> None:
-    operation = reserve_monthly(
+    operation = reserve_quota(
         db_session,
         org_id=monthly_quota.org_id,
         feature=monthly_quota.feature,
@@ -183,13 +195,15 @@ def test_stale_claim_cannot_finalize_or_release(
 
 
 def test_old_month_release_does_not_refund_current_month(
-    db_session: Session, monthly_quota: FeatureQuotaMonthly
+    db_session: Session,
+    monthly_quota: FeatureQuotaMonthly,
+    extra_quota: FeatureQuotaExtra,
 ) -> None:
-    operation = reserve_monthly(
+    operation = reserve_quota(
         db_session,
         org_id=monthly_quota.org_id,
         feature=monthly_quota.feature,
-        units=3,
+        units=13,
         idempotency_key=uuid4(),
     )
     # Simulate resetting the single aggregate row and consuming two units in the new month.
@@ -212,3 +226,92 @@ def test_old_month_release_does_not_refund_current_month(
     db_session.refresh(monthly_quota)
     assert monthly_quota.units_consumed == 2
     assert monthly_quota.units_remaining == 8
+    db_session.refresh(extra_quota)
+    assert extra_quota.units_consumed == 0
+    assert extra_quota.units_remaining == 7
+
+
+def test_mixed_reservation_uses_monthly_first_and_replays_without_another_charge(
+    db_session: Session,
+    monthly_quota: FeatureQuotaMonthly,
+    extra_quota: FeatureQuotaExtra,
+) -> None:
+    arguments = dict(
+        org_id=monthly_quota.org_id,
+        feature=monthly_quota.feature,
+        units=13,
+        idempotency_key=uuid4(),
+    )
+    operation = reserve_quota(db_session, **arguments)
+    repeated = reserve_quota(db_session, **arguments)
+    assert operation.id == repeated.id
+    assert operation.used_from_monthly == 10
+    assert operation.used_from_extra == 3
+    db_session.refresh(monthly_quota)
+    db_session.refresh(extra_quota)
+    assert monthly_quota.units_consumed == 10
+    assert monthly_quota.units_remaining == 0
+    assert extra_quota.units_consumed == 3
+    assert extra_quota.units_remaining == 4
+
+
+@pytest.mark.parametrize("expired", [False, True], ids=["insufficient", "expired"])
+def test_unusable_credits_roll_back_monthly_deduction_and_operation(
+    db_session: Session,
+    monthly_quota: FeatureQuotaMonthly,
+    extra_quota: FeatureQuotaExtra,
+    expired: bool,
+) -> None:
+    if expired:
+        with db_session.begin():
+            extra_quota.expires_on = extra_quota.last_added - timedelta(days=1)
+    with pytest.raises(InsufficientQuota):
+        reserve_quota(
+            db_session,
+            org_id=monthly_quota.org_id,
+            feature=monthly_quota.feature,
+            units=13 if expired else 18,
+            idempotency_key=uuid4(),
+        )
+    db_session.refresh(monthly_quota)
+    db_session.refresh(extra_quota)
+    assert monthly_quota.units_consumed == 0
+    assert monthly_quota.units_remaining == 10
+    assert extra_quota.units_consumed == 0
+    assert extra_quota.units_remaining == 7
+    assert db_session.scalars(
+        select(QuotaUsagePerRequest).where(
+            QuotaUsagePerRequest.org_id == monthly_quota.org_id
+        )
+    ).all() == []
+
+
+def test_credit_only_release_refunds_once_without_extending_expiration(
+    db_session: Session,
+    monthly_quota: FeatureQuotaMonthly,
+    extra_quota: FeatureQuotaExtra,
+) -> None:
+    arguments = dict(org_id=monthly_quota.org_id, feature=monthly_quota.feature)
+    reserve_quota(db_session, units=10, idempotency_key=uuid4(), **arguments)
+    operation = reserve_quota(db_session, units=7, idempotency_key=uuid4(), **arguments)
+    assert operation.used_from_monthly == 0
+    assert operation.used_from_extra == 7
+    expires_on = extra_quota.last_added - timedelta(days=1)
+    with db_session.begin():
+        extra_quota.expires_on = expires_on
+
+    for _ in range(2):
+        released = release_reservation(
+            db_session, operation_id=operation.id, claim_version=operation.claim_version
+        )
+        assert released.status == FeatureQuotaStatus.RELEASED
+    # A refund restores accounting, not credit validity.
+    with pytest.raises(InsufficientQuota):
+        reserve_quota(db_session, units=7, idempotency_key=uuid4(), **arguments)
+    db_session.refresh(monthly_quota)
+    db_session.refresh(extra_quota)
+    assert monthly_quota.units_consumed == 10
+    assert monthly_quota.units_remaining == 0
+    assert extra_quota.units_consumed == 0
+    assert extra_quota.units_remaining == 7
+    assert extra_quota.expires_on == expires_on
