@@ -1,17 +1,91 @@
 # portcast-assignment
 
-## Development database
+## One-command demo runtime
 
-Requires Docker with Docker Compose v2. Start PostgreSQL 17 and wait for readiness:
+Requires a running Docker daemon and Docker Compose v2. From the repository root:
 
 ```sh
-docker compose up -d --wait
+docker compose up --build -d --wait
 ```
 
 If Compose v2 is installed as the standalone `docker-compose` command rather
 than the Docker plugin, use `docker-compose` instead of `docker compose` in the
-commands below (for example, `docker-compose up -d --wait`). The Docker daemon
+commands below (standalone v2.32.2 was verified available). The Docker daemon
 must be running first; for a Colima-based setup, start it with `colima start`.
+
+Compose starts PostgreSQL, a one-shot `setup` job, the reporting `server`, the
+schedule `consumer`, and a separate `recovery` worker. No `.env` file or host
+Python installation is needed for this demo: containers receive fixed,
+development-only database credentials matching PostgreSQL.
+
+Setup waits for healthy PostgreSQL, then runs `init_db`,
+`migrate_operation_context`, `migrate_recovery_index`, and `seed_demo` sequentially
+using the consumer image. Both APIs and the worker wait for successful setup and
+healthy PostgreSQL. Each API has its own database-aware HTTP health check.
+The worker has no dedicated health check: `--wait` checks that its process is
+running; the runtime smoke check below verifies actual recovery.
+
+Default host ports are PostgreSQL **5433**, reporting **8000**, and schedule
+**8001**, all bound to localhost. The worker publishes no port, reuses the
+consumer image with a separate command, and has `restart: unless-stopped`,
+`init: true`, and a 15-second stop grace period. Images still contain only shared
+source plus their respective application.
+
+Find the seeded demo organization ID and check both APIs:
+
+```sh
+docker compose logs setup
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8001/health
+```
+
+Use that organization ID with the schedule request on port 8001 in
+[Metered demo consumer](#metered-demo-consumer) and the reporting request below.
+Setup is serial development provisioning, not a general production migration
+system. Seeding does not refill an existing allowance. Starting the default
+project can reuse an older named volume; this command does not reset data.
+
+### Runtime smoke check (optional host tooling)
+
+This check requires host `uv` dependencies (`uv sync --locked`) and database
+configuration from a copied `.env.example` → `.env` or exported `DB_*` values.
+The configured database must be the same one used by both API URLs (defaults
+`http://127.0.0.1:8000` and `http://127.0.0.1:8001`).
+
+```sh
+uv run python -m scripts.runtime_smoke --allow-demo-writes
+```
+
+The script creates a unique organization fixture and cleans up its rows. It checks
+real HTTP health, schedule requests, saved-response replay, input conflict, and
+usage reporting, then commits an expired hold and waits for the actual polling
+worker to resolve it. This simulates abandonment; it does not crash a process.
+
+Fresh startup and this smoke check passed on an isolated Compose project using:
+
+```sh
+POSTGRES_HOST_PORT=55433 SERVER_HOST_PORT=18000 CONSUMER_HOST_PORT=18001 \
+  docker-compose -p portcast-runtime-check up --build -d --wait
+DB_HOST=127.0.0.1 DB_PORT=55433 DB_NAME=portcast \
+  DB_USERNAME=portcast DB_PASSWORD=portcast_dev \
+  uv run python -m scripts.runtime_smoke --allow-demo-writes \
+  --server-url http://127.0.0.1:18000 --consumer-url http://127.0.0.1:18001
+```
+
+Full `down`/`up` with the volume retained was also verified: setup reran without
+an `.env` file, the demo balance remained 499/500, and the saved response replayed
+without another charge. The isolated verification stack/volume were then removed;
+the original development database was left running and its volume preserved.
+The full suite passed **43 tests** on a separate `portcast_test` database while
+the demo worker ran against `portcast`. These checks are not load benchmarks.
+
+## Development database
+
+For host-based development, start just PostgreSQL instead of the full runtime:
+
+```sh
+docker compose up -d --wait postgres
+```
 
 The database is available at `127.0.0.1:5433` (container port remains `5432`):
 
@@ -34,26 +108,24 @@ Check service status:
 docker compose ps
 ```
 
-Stop the database while preserving its data:
+Stop the Compose runtime while preserving database data:
 
 ```sh
 docker compose down
 ```
 
-To intentionally delete all local database data as well:
+**Destructive:** only use the following to intentionally delete all local database
+data as well:
 
 ```sh
 docker compose down -v
 ```
 
-Compose starts only the development database. It does not start applications or
-run schema initialization/migrations. The recovery worker runs separately using
-the consumer package; its commands are below.
-
 ## Separate FastAPI applications
 
-With PostgreSQL running, copy `.env.example` to `.env` if you do not already have
-one. Install the locked Python dependencies:
+For host-based applications, use the PostgreSQL-only command above, copy
+`.env.example` to `.env` if you do not already have one (or export `DB_*` values),
+and run the explicit schema/seed commands below. Install the locked dependencies:
 
 ```sh
 uv sync --locked
@@ -144,13 +216,34 @@ with its own explicit migration below.
 Pydantic validates configuration and API request/response schemas; these table
 definitions use SQLAlchemy, not Pydantic API models.
 
+## Dedicated test database
+
+Use a separate database so a running recovery worker cannot claim test fixtures.
+Never point these tests at a production database. With the default Compose
+PostgreSQL running and host dependencies/configuration ready:
+
+```sh
+# Create once; skip this command if portcast_test already exists.
+docker compose exec -T postgres createdb -U portcast portcast_test
+
+DB_NAME=portcast_test uv run python -m src.shared.init_db
+DB_NAME=portcast_test uv run python -m src.shared.migrate_operation_context
+DB_NAME=portcast_test uv run python -m src.shared.migrate_recovery_index
+DB_NAME=portcast_test uv run pytest -q
+```
+
+Keep the API and polling worker on `portcast`, not `portcast_test`. Tests clean up
+their own rows; no blanket database reset is needed. `DB_NAME` overrides the root
+`.env` value. If using custom host ports, also set `DB_PORT` to that project's
+published PostgreSQL port. Schema commands do not drop existing data.
+
 ## Quota reservation and settlement
 
 With PostgreSQL running and the development schema initialized:
 
 ```sh
 uv sync --locked
-uv run pytest
+DB_NAME=portcast_test uv run pytest
 ```
 
 `src/shared/quota.py` claims an operation key using PostgreSQL `INSERT ... ON CONFLICT
@@ -297,7 +390,7 @@ and 10 purchased credits: exactly five complete batches consume all 35 units,
 35 batches are rejected, and allocation records match both balances.
 
 ```sh
-uv run pytest tests/test_quota_concurrency.py -q
+DB_NAME=portcast_test uv run pytest tests/test_quota_concurrency.py -q
 ```
 
 This requires visibility of the test connections in `pg_stat_activity` (the local
@@ -366,7 +459,7 @@ atomically coordinated with the database here. The endpoint is demo-only with
 no production organization authentication or contract enforcement.
 
 ```sh
-uv run pytest tests/test_consumer.py -q
+DB_NAME=portcast_test uv run pytest tests/test_consumer.py -q
 ```
 
 Consumer tests cover successful outcome/replay, equal-cost input conflict,
@@ -388,8 +481,8 @@ shared + server source; `Dockerfile.consumer` copies only shared + consumer sour
 Supply database credentials at runtime with `--env-file .env`; do not embed
 secrets in images.
 
-With the Compose database running and the schema/seed commands above completed,
-attach both applications to its network:
+As a manual-container alternative, start only the Compose `postgres` service and
+complete the schema/seed commands above, then attach both applications to its network:
 
 ```sh
 docker network ls
@@ -410,9 +503,10 @@ docker run --env-file .env -e DB_HOST=host.docker.internal -p 127.0.0.1:8001:800
 
 These commands use the `.env` host database port, normally 5433. With Colima,
 host routing depends on the environment; prefer the shared Compose network above.
-Compose remains database-only, and application startup does not run schema
-migrations. The schedule API and recovery worker are distinct processes in the
-consumer package; the worker is started explicitly, not inside each API process.
+The full Compose runtime automates setup separately; application startup itself
+does not run schema migrations. The schedule API and recovery worker are distinct
+processes in the consumer package. Compose starts the worker as its own service;
+manual host/container deployments use the explicit commands below.
 
 ## Lease recovery and separate polling worker
 
@@ -486,7 +580,7 @@ Use your actual Compose network name. No published port is needed for the worker
 This does not add a third source package or merge the server into the consumer.
 
 ```sh
-uv run pytest tests/test_recovery.py tests/test_consumer.py tests/test_quota_concurrency.py -q
+DB_NAME=portcast_test uv run pytest tests/test_recovery.py tests/test_consumer.py tests/test_quota_concurrency.py -q
 ```
 
 Tests cover abandoned durable inputs, bounded recovery, confirmed refunds,

@@ -1,3 +1,30 @@
+# Fixed credentials below are for the local demo only; no .env file is required.
+x-database-environment: &database-environment
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_NAME: portcast
+  DB_USERNAME: portcast
+  DB_PASSWORD: portcast_dev
+
+x-consumer-image: &consumer-image
+  image: portcast-consumer
+  build:
+    context: .
+    dockerfile: Dockerfile.consumer
+  environment: *database-environment
+  init: true
+
+x-api-healthcheck: &api-healthcheck
+  test:
+    - CMD
+    - /app/.venv/bin/python
+    - -c
+    - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"
+  interval: 5s
+  timeout: 3s
+  retries: 10
+  start_period: 15s
+
 services:
   postgres:
     image: postgres:17
@@ -7,7 +34,7 @@ services:
       POSTGRES_PASSWORD: portcast_dev
       POSTGRES_DB: portcast
     ports:
-      - "127.0.0.1:5433:5432"
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5433}:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -16,6 +43,61 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+
+  setup:
+    <<: *consumer-image
+    # One serial setup job, not schema/grants in each application startup.
+    command:
+      - /bin/sh
+      - -c
+      - >-
+        /app/.venv/bin/python -m src.shared.init_db &&
+        /app/.venv/bin/python -m src.shared.migrate_operation_context &&
+        /app/.venv/bin/python -m src.shared.migrate_recovery_index &&
+        /app/.venv/bin/python -m src.consumer.seed_demo
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  server:
+    image: portcast-server
+    build:
+      context: .
+      dockerfile: Dockerfile.server
+    environment: *database-environment
+    init: true
+    ports:
+      - "127.0.0.1:${SERVER_HOST_PORT:-8000}:8000"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck: *api-healthcheck
+    restart: unless-stopped
+
+  consumer:
+    <<: *consumer-image
+    ports:
+      - "127.0.0.1:${CONSUMER_HOST_PORT:-8001}:8000"
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    healthcheck: *api-healthcheck
+    restart: unless-stopped
+
+  recovery:
+    <<: *consumer-image
+    command: ["/app/.venv/bin/python", "-m", "src.consumer.recovery_worker"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    stop_grace_period: 15s
 
 volumes:
   postgres_data:

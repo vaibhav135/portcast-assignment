@@ -18,6 +18,10 @@ independently designed by one party. Update it as implementation progresses.
   recovery; `main` was pushed. The author then reviewed and approved recovery,
   explicitly authorizing its commit/local merge and the next runtime slice.
   Attribution documentation was explicitly requested by the author.
+  Recovery commit `1fbdb16` was merged into local `main`, and the approved next
+  branch is `chore/demo-runtime`. The author reviewed and approved the one-command
+  runtime slice, including the optional integration smoke script. No push was
+  authorized for this transition.
 
 ## 1. Collaboration agreement
 
@@ -111,6 +115,9 @@ is not the same as independently writing that code.
   with independent images, no cross-app imports, and a direct shared quota library
   backed by the same PostgreSQL database. This supersedes the earlier combined
   API/consumer deployment topology; it does not request an HTTP quota service.
+- Asked for the application/deployment boundary to be explicit, then approved
+  committing and locally merging recovery, creating the next branch, and fully
+  implementing the one-command demo runtime.
 
 ## 3. Assistant's contributions
 
@@ -157,6 +164,7 @@ has final approval or that all planned behavior is implemented.
 | Author-directed app split | Assistant reorganized shared/server/consumer code with no cross-app imports and separate health routes |
 | Separate app images | `Dockerfile.server` and `Dockerfile.consumer`, locked `uv` dependencies and only shared + respective app source |
 | Recovery slice | Shared expired-lease claims, `src/consumer/recovery_worker.py`, common persisted-input execution for retry/polling, and explicit partial-index migration |
+| One-command runtime | Compose configuration for PostgreSQL, serial one-shot setup, independently health-checked APIs, and separate recovery service; `scripts/runtime_smoke.py` and runtime documentation |
 
 The assistant selected implementation details such as synchronous SQLAlchemy
 sessions, psycopg, SQLAlchemy URL construction, database constraints, explicit
@@ -194,6 +202,17 @@ human implementation decisions.
   and clean SIGTERM shutdown after its first poll. The full suite including
   recovery and the acknowledgement test passed **43 tests** against real PostgreSQL;
   the independent-process claim test passed again in a separate run.
+- Verified standalone `docker-compose` v2.32.2 availability, fresh full-runtime
+  startup, and `scripts/runtime_smoke.py` on isolated project
+  `portcast-runtime-check`, using host ports 55433/18000/18001 and matching host
+  database configuration/API URLs. The script checks actual HTTP schedule work,
+  replay, conflict, reporting, and polling recovery of an expired committed hold,
+  with unique-organization fixture cleanup. It simulates abandonment without an
+  actual process crash. Verified full down/up with the volume retained and no
+  `.env` file: setup preserved a 499/500 balance and the saved response replayed
+  without another charge. The full **43-test** suite passed on `portcast_test`,
+  separate from the demo worker's `portcast` database. Removed only the isolated
+  verification stack/volume afterward, preserving the original development database.
 
 Test runtimes are **not load-test results**. No end-to-end throughput/latency
 benchmark has been completed yet. Passing tests do not establish every production
@@ -221,7 +240,11 @@ failure guarantee.
   On the author's subsequent explicit request, pushed `main` to `origin`, including
   reporting commit `6c8f299` and consumer/split commit `fed2fc7`. The author later
   approved committing/merging recovery and creating `chore/demo-runtime`; no push
-  was authorized for that transition. Temporary `TODO.md` edits remain uncommitted.
+  was authorized for that transition. The assistant performed the delegated Git
+  operations: created recovery commit `1fbdb16`, merged it into local `main`, and
+  created `chore/demo-runtime`. The author subsequently reviewed and approved the
+  runtime implementation/docs for the usual commit/local-merge workflow.
+  Temporary `TODO.md` edits remain uncommitted.
 
 ## 4. Jointly refined decisions
 
@@ -231,7 +254,7 @@ These are collaborative outcomes, not exclusively human- or AI-originated:
 - Fixed UTC calendar months instead of the originally explored rolling window.
 - Reservation before execution, no second success deduction, source-specific failure refunds.
 - A single reusable quota library, now imported directly by the separate reporting
-  server and schedule consumer; a separately deployed recovery worker remains planned.
+  server and schedule consumer, plus the implemented separate recovery worker.
 - Original-period settlement using per-operation identity and one mutable monthly aggregate.
 - Feature-specific deduplication/freshness, free paid-result reuse while fresh, and
   explicit operation identity for retries/recovery.
@@ -244,12 +267,20 @@ These are collaborative outcomes, not exclusively human- or AI-originated:
   demo consumer currently charges when a valid result is durably recorded with
   `DONE`; it does **not** prove LB transmission. This narrower implementation must
   remain documented, not presented as the original delivery policy solved.
-- Concurrent in-progress demo retries may repeat cheap pure computation; this is
-  not exactly-once execution for a real third-party operation.
+- Active unfinished retries are rejected; an expired original executor may still
+  overlap recovery computation. This is not exactly-once external execution.
 - A saved result and accounting state support recognized replay, but do not solve
   refresh with a new key, indefinite result retention, or external uncertain outcomes.
-- Contract/grace enforcement, fresh-result reuse across keys, one-command complete
-  runtime, benchmarks, and final `DESIGN.md` remain unfinished. Recovery is limited
+- The one-command Compose runtime is implemented and approved. It uses fixed
+  local-demo credentials without requiring `.env` or host Python, preserves the
+  PostgreSQL named volume, and runs serial development setup without refilling an
+  existing allowance. The optional smoke script requires host `uv` dependencies
+  and DB environment/`.env` targeting the same database as both API URLs.
+  Worker process readiness in `--wait` is not a dedicated recovery health check;
+  actual recovery was verified by the smoke script. Full restart/persistence and
+  dedicated test-database isolation were verified too; none are load benchmarks.
+- Contract/grace enforcement, fresh-result reuse across keys, benchmarks, and
+  final `DESIGN.md` remain unfinished. Recovery is limited
   to the pure demo schedule lookup: no external-write exactly-once execution,
   heartbeat, actual execution timeout, or permanent retry cap is implemented.
 - No real payment system, notification delivery, UI, or carrier integration was built.

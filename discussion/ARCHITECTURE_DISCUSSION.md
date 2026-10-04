@@ -22,10 +22,46 @@ topology recorded below; the earlier discussion is preserved as history.
   use the same PostgreSQL database. Quota is not a separate HTTP service.
 - Separate server/consumer images contain only shared source + their own app and
   install locked dependencies with `uv`; credentials are supplied at runtime.
-- Compose remains database-only. Schema setup/migrations are explicit commands.
+- Compose now runs PostgreSQL, one-shot setup, both APIs, and a separate recovery
+  service with `docker compose up --build -d --wait`. Host development can start
+  just PostgreSQL with `docker compose up -d --wait postgres`.
   The recovery worker is a separate process at `src/consumer/recovery_worker.py`,
   not the schedule HTTP app. It reuses the consumer image with a different command
   and imports shared accounting, without including or importing server code.
+
+**Author-approved runtime checkpoint:** recovery commit `1fbdb16` was merged into
+local `main`, then `chore/demo-runtime` was created for the approved one-command
+runtime implementation. The author reviewed and approved the runtime slice for
+the usual commit/local-merge workflow; no push was authorized for this transition.
+
+Compose needs no host Python or `.env`: fixed dev-only credentials match
+PostgreSQL. Defaults bind only localhost (database 5433, reporting 8000, schedule
+8001). Setup uses the consumer image and waits for healthy PostgreSQL, then runs
+`init_db`, `migrate_operation_context`, `migrate_recovery_index`, and `seed_demo`
+serially. APIs and recovery wait for setup completion and healthy PostgreSQL;
+each API has an independent HTTP health check. This is development setup, not
+general production migration orchestration, and seeding does not refill balances.
+The named PostgreSQL volume is preserved, including when an existing default
+project is reused. `docker compose down` retains it; `down -v` explicitly deletes
+the data.
+
+Recovery reuses the consumer image, publishes no port, and runs with
+`restart: unless-stopped`, `init: true`, and a 15-second stop grace period. It has
+no dedicated health check: Compose `--wait` verifies a running process, while
+`scripts/runtime_smoke.py` verifies actual recovery. The optional host `uv` script
+needs dependencies and `DB_*` configuration targeting the same database as both
+API URLs. With `--allow-demo-writes`, it creates/cleans a unique organization,
+checks real HTTP replay/conflict/reporting, and inserts an expired committed hold
+for the polling worker to resolve. It simulates abandonment, not an actual crash.
+
+Fresh startup and the smoke script passed using standalone Compose v2.32.2 on
+project `portcast-runtime-check` with host ports 55433/18000/18001 and matching
+script DB configuration/API URLs. Full down/up with the volume retained preserved
+the demo's 499/500 balance and saved-response replay after serial setup reran
+without an `.env` file. The full 43-test suite passed on a dedicated `portcast_test`
+database while the worker remained on `portcast`. The isolated verification stack
+and volume were removed afterward; the original development database was preserved.
+No load/throughput claims follow from these checks.
 
 **Recovery implementation checkpoint:** the demo now has expired-lease claims
 with `SKIP LOCKED`, claim-version fencing, retry-driven recovery, and periodic
@@ -482,7 +518,8 @@ to HTTP responses. Quota accounting should not be coupled to response rendering.
 Framework, exact interfaces, runtime configuration, and packaging are still
 undecided at this discussion checkpoint. The earlier two-process topology is
 superseded by the latest author-requested server/consumer split; the recovery
-worker remains future work.
+worker was future work at that historical checkpoint and is now implemented as
+described in the latest update above.
 
 A separate service can offer independent scaling and a shared integration
 boundary, but adds a network hop and additional failure handling. Server load
