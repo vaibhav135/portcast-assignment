@@ -144,12 +144,31 @@ idempotency. Replay also depends on retaining the operation record. No key-reten
 or response-replay policy is implemented yet.
 
 The basic tests cover reservation, rejection without side effects, replay after
-exhaustion, and conflicting unit counts. This slice assumes configured,
-current-period balances. Mixed-allocation tests verify the recorded source split,
+exhaustion, and conflicting unit counts. This slice assumes configured balances;
+expired monthly rows are refreshed lazily. Mixed-allocation tests verify the recorded source split,
 uncharged replay, and rollback when credits are insufficient or expired.
-Automatic period resets, ownership recovery, cache behavior, and contract
-eligibility are not implemented yet. In particular, credit expiry is not a
+Ownership recovery, cache behavior, and contract eligibility are not implemented
+yet. In particular, credit expiry is not a
 replacement for checking active-contract/grace eligibility.
+
+### Calendar-month reset
+
+The first new admission or release touching an expired monthly aggregate refreshes
+it under its row lock. Reset sets consumed units to zero and remaining units to
+the configured allowance, then moves `resets_on` to the first of the next month
+at 00:00 UTC. Skipped months grant only the current allowance, with no rollover.
+Purchased credits are not reset. No scheduled reset job or historical aggregate
+table is required.
+
+PostgreSQL supplies the authoritative time after monthly-lock acquisition;
+`dateutil` handles calendar arithmetic. A new operation's original reservation
+timestamp/lease are assigned at that admission point before commit, not before
+lock waits. Committed timestamps remain unchanged during replay or recovery.
+Known-key replay returns the existing operation and does not grant fresh capacity.
+
+Reset and admission share a transaction; rejected admission rolls its changes
+back too. A later admission/reporting access can refresh the row again. The usage
+endpoint is not implemented yet; it must use the same locked refresh policy.
 
 ### Finalization and source-specific release
 
@@ -164,6 +183,8 @@ Release locks the current monthly balance row too, refunding only when its
 `resets_on` boundary identifies the reservation's original UTC month. An old-month
 operation is closed without adding capacity to a newer month. The monthly reset
 implementation must update that boundary atomically with its counters.
+Release itself uses the locked refresh policy before deciding whether its monthly
+allocation still belongs to the current aggregate.
 
 Purchased credits are restored to their own balance, including after a monthly
 reset. Release never extends `expires_on`; an expired balance may show refunded
@@ -213,3 +234,9 @@ Compose database user supports it). It exercises quota admission under real
 cross-process contention, not completed downstream work, failover, or load-test
 latency. Shared development feature configuration should not be changed while
 running this test; it is not intended for a production database.
+
+Reset tests replace only the clock seam while still using real Postgres. They
+cover the exact UTC boundary, leap February/year transitions, skipped months,
+unchanged credits, and old-period release. Cross-process exhaustion also runs
+against an expired monthly aggregate: concurrent first requests must collectively
+receive one allowance, not one allowance per instance.

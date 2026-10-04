@@ -1,6 +1,7 @@
-from datetime import timedelta, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
+from dateutil.relativedelta import relativedelta
 from sqlalchemy import func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
@@ -27,6 +28,24 @@ class OperationConflict(Exception):
     """The claim is stale or the requested transition conflicts with final state."""
 
 
+def _database_now(session: Session) -> datetime:
+    """Authoritative clock; tests may replace this seam without mocking accounting."""
+    return session.scalar(select(func.clock_timestamp())).astimezone(timezone.utc)
+
+
+def _refresh_monthly_quota(session: Session, quota: FeatureQuotaMonthly) -> datetime:
+    """Refresh in place; the caller must hold this aggregate row's FOR UPDATE lock."""
+    now = _database_now(session)
+    if now >= quota.resets_on:
+        month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        quota.units_consumed = 0
+        quota.units_remaining = quota.total_allocated
+        quota.last_renewed = now
+        quota.resets_on = month_start + relativedelta(months=1)
+        session.flush()
+    return now
+
+
 def reserve_quota(
     session: Session,
     *,
@@ -37,7 +56,8 @@ def reserve_quota(
 ) -> QuotaUsagePerRequest:
     """Reserve monthly allowance first, then unexpired credits, in one transaction.
 
-    Assumes a configured organization/feature in the current period. Keys are
+    Assumes a configured organization/feature; an expired monthly row is refreshed
+    lazily under its lock. Keys are
     scoped to organization and feature; same-key retries return the existing
     operation, while a changed unit quantity raises IdempotencyConflict.
 
@@ -45,8 +65,8 @@ def reserve_quota(
     Insufficient capacity must leave both balances and operation records unchanged.
     Return a detached RESERVED operation after committing; do not execute feature
     work here. The caller must inspect its status; replay does not restart released
-    work or take over an expired lease. Resets and recovery are separate
-    slices. Concurrent key claiming relies on PostgreSQL READ COMMITTED isolation.
+    work or take over an expired lease. Recovery is a separate slice.
+    Concurrent key claiming relies on PostgreSQL READ COMMITTED isolation.
     """
     if units <= 0:
         raise ValueError("Reservation units must be positive")
@@ -97,17 +117,23 @@ def reserve_quota(
 
         # Hold the monthly row while determining the split. All accounting paths
         # acquire locks in operation -> monthly -> credits order.
-        available_monthly = session.scalar(
-            select(FeatureQuotaMonthly.units_remaining)
+        monthly_quota = session.scalar(
+            select(FeatureQuotaMonthly)
             .where(
                 FeatureQuotaMonthly.org_id == org_id,
                 FeatureQuotaMonthly.feature == feature,
             )
             .with_for_update()
+            .execution_options(populate_existing=True)
         )
-        if available_monthly is None:
+        if monthly_quota is None:
             raise InsufficientQuota("Monthly quota is not configured")
-        monthly_units = min(available_monthly, units)
+        admitted_at = _refresh_monthly_quota(session, monthly_quota)
+        # Assign the original admission time only once, before its first commit.
+        # Key/row-lock waits must not assign an old period or an already-expired lease.
+        operation.reserved_at = admitted_at
+        operation.lease_expires_at = admitted_at + timedelta(seconds=lease_duration)
+        monthly_units = min(monthly_quota.units_remaining, units)
         credit_units = units - monthly_units
 
         if monthly_units:
@@ -218,6 +244,8 @@ def _settle_reservation(
             )
             if quota is None:
                 raise RuntimeError("Monthly accounting row is missing")
+
+            _refresh_monthly_quota(session, quota)
 
             # resets_on is the exclusive next-month boundary. No historical
             # aggregate is needed: only refund if this row still holds the same month.

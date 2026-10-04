@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
 import pytest
-from sqlalchemy import URL, Engine, create_engine, delete, insert, select, text
+from sqlalchemy import URL, Engine, create_engine, delete, insert, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -171,10 +171,25 @@ def _run_contending_reservations(
     )
 
 
+@pytest.mark.parametrize("needs_reset", [False, True], ids=["current", "expired-period"])
 def test_independent_processes_cannot_overspend(
     committed_quota: tuple[Engine, int],
+    needs_reset: bool,
 ) -> None:
     engine, org_id = committed_quota
+    if needs_reset:
+        with engine.begin() as connection:
+            connection.execute(
+                update(FeatureQuotaMonthly)
+                .where(FeatureQuotaMonthly.org_id == org_id)
+                .values(
+                    units_consumed=25,
+                    units_remaining=0,
+                    resets_on=datetime.now(timezone.utc).replace(
+                        day=1, hour=0, minute=0, second=0, microsecond=0
+                    ),
+                )
+            )
     outcomes = _run_contending_reservations(engine, org_id)
 
     assert sum(len(operation_ids) for operation_ids, _ in outcomes) == 25
