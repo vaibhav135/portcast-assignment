@@ -237,6 +237,14 @@ their own rows; no blanket database reset is needed. `DB_NAME` overrides the roo
 `.env` value. If using custom host ports, also set `DB_PORT` to that project's
 published PostgreSQL port. Schema commands do not drop existing data.
 
+## Local performance measurements
+
+See [`benchmarks/README.md`](benchmarks/README.md) for isolated k6 HTTP workloads,
+four-worker consumer setup, opt-in quota timing headers, and post-load accounting
+reconciliation. This uses `portcast_load`, not the demo or pytest database.
+The workload covers one implemented schedule feature; it does not claim to
+exercise 30 features or prove multi-machine production capacity.
+
 ## Quota reservation and settlement
 
 With PostgreSQL running and the development schema initialized:

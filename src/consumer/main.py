@@ -1,7 +1,7 @@
 from typing import Annotated
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -16,6 +16,7 @@ from ..shared.quota import (
 from ..shared.schemas import HealthResponse
 from .schemas import ScheduleSearchRequest, ScheduleSearchResponse
 from .service import DemoFeatureFailure, DemoFeatureTimeout, search_schedules
+from .timing import request_timing
 
 
 app = FastAPI(title="Portcast schedule-search consumer", lifespan=lifespan)
@@ -34,23 +35,25 @@ def health(session: Annotated[Session, Depends(get_session)]) -> HealthResponse:
 def schedule_search(
     org_id: int,
     request: ScheduleSearchRequest,
+    response: Response,
     idempotency_key: Annotated[UUID, Header(alias="Idempotency-Key")],
     session: Annotated[Session, Depends(get_session)],
 ) -> ScheduleSearchResponse:
     # Demo interface: production integration must authenticate and scope org access.
-    try:
-        return search_schedules(
-            session, org_id=org_id, idempotency_key=idempotency_key, request=request
-        )
-    except QuotaNotConfigured as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    except InsufficientQuota as exc:
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
-    except (IdempotencyConflict, OperationConflict) as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-    except DemoFeatureTimeout as exc:
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
-    except DemoFeatureFailure as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
-    except SQLAlchemyError as exc:
-        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+    with request_timing(response):
+        try:
+            return search_schedules(
+                session, org_id=org_id, idempotency_key=idempotency_key, request=request
+            )
+        except QuotaNotConfigured as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except InsufficientQuota as exc:
+            raise HTTPException(status_code=429, detail=str(exc)) from exc
+        except (IdempotencyConflict, OperationConflict) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DemoFeatureTimeout as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        except DemoFeatureFailure as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        except SQLAlchemyError as exc:
+            raise HTTPException(status_code=503, detail="Database unavailable") from exc

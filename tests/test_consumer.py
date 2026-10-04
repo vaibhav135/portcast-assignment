@@ -4,7 +4,7 @@ from uuid import uuid4
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import select, update
+from sqlalchemy import event, select, update
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session
 
@@ -119,15 +119,27 @@ def test_completed_replay_keeps_original_charge_after_feature_repricing(
         db_session.execute(
             update(APIQuotaMap)
             .where(APIQuotaMap.feature == APIFeature.SAILING_SCHEDULE)
-            .values(unit_cost=3)
+            .values(unit_cost=3, lease_duration_sec=90)
         )
 
-    replay = api_client.post(path, headers=headers, json=payload)
-    assert replay.status_code == 200, replay.text
-    assert replay.json() == first.json()
-    assert calls == 1
-    changed = api_client.post(path, headers=headers, json={"routes": ["different-route"]})
-    assert changed.status_code == 409
+    config_reads = []
+    connection = db_session.get_bind()
+
+    def configuration_read(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("SELECT") and "api_quota_map" in statement:
+            config_reads.append(statement)
+
+    event.listen(connection, "before_cursor_execute", configuration_read)
+    try:
+        replay = api_client.post(path, headers=headers, json=payload)
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == first.json()
+        assert calls == 1
+        changed = api_client.post(path, headers=headers, json={"routes": ["different-route"]})
+        assert changed.status_code == 409
+    finally:
+        event.remove(connection, "before_cursor_execute", configuration_read)
+    assert config_reads == []
     assert calls == 1
     usage = get_quota_usage(db_session, **arguments)
     assert usage.monthly.used == 2
@@ -140,6 +152,9 @@ def test_completed_replay_keeps_original_charge_after_feature_repricing(
     )
     assert fresh.status_code == 200, fresh.text
     assert calls == 2
+    with db_session.begin():
+        operation = db_session.get(QuotaUsagePerRequest, fresh.json()["operation_id"])
+        assert operation.lease_expires_at - operation.reserved_at == timedelta(seconds=90)
     usage = get_quota_usage(db_session, **arguments)
     assert usage.monthly.used == 8
     assert usage.monthly.reserved == 0
@@ -199,7 +214,7 @@ def test_rejected_and_invalid_requests_do_not_execute_feature(
     def unavailable_admission(*args, **kwargs):
         raise OperationalError("admission", {}, RuntimeError("simulated connection loss"))
 
-    monkeypatch.setattr(consumer_module, "reserve_quota", unavailable_admission)
+    monkeypatch.setattr(consumer_module, "_reserve_quota_in_transaction", unavailable_admission)
     assert api_client.post(path, headers=headers, json={"routes": ["route"]}).status_code == 503
 
 

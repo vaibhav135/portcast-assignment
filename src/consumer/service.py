@@ -10,10 +10,10 @@ from ..shared.quota import (
     IdempotencyConflict,
     OperationConflict,
     QuotaNotConfigured,
+    _reserve_quota_in_transaction,
     claim_expired_reservations,
     finalize_reservation,
     release_reservation,
-    reserve_quota,
 )
 from .schemas import (
     DemoBehavior,
@@ -21,6 +21,7 @@ from .schemas import (
     ScheduleSearchRequest,
     ScheduleSearchResponse,
 )
+from .timing import time_quota
 
 
 class DemoFeatureFailure(Exception):
@@ -51,6 +52,25 @@ def search_schedules(
     idempotency_key: UUID,
     request: ScheduleSearchRequest,
 ) -> ScheduleSearchResponse:
+    operation = time_quota(
+        "quota_admission",
+        _admit_schedule_operation,
+        session,
+        org_id=org_id,
+        idempotency_key=idempotency_key,
+        request=request,
+    )
+    return execute_schedule_operation(session, operation)
+
+
+def _admit_schedule_operation(
+    session: Session,
+    *,
+    org_id: int,
+    idempotency_key: UUID,
+    request: ScheduleSearchRequest,
+) -> QuotaUsagePerRequest:
+    """Commit fresh lookup, pricing, and reservation together before feature work."""
     feature = APIFeature.SAILING_SCHEDULE
     request_payload = request.model_dump(mode="json")
     with session.begin():
@@ -63,37 +83,40 @@ def search_schedules(
             )
             .execution_options(populate_existing=True)
         )
+        fresh = operation is None
         if operation is not None:
             # Existing work retains its original allocation, regardless of repricing.
             if operation.request_payload != request_payload:
                 raise IdempotencyConflict("Operation key already used with different inputs")
             session.expunge(operation)
         else:
-            unit_cost = session.scalar(
-                select(APIQuotaMap.unit_cost).where(APIQuotaMap.feature == feature)
-            )
-            if unit_cost is None:
+            configuration = session.execute(
+                select(APIQuotaMap.unit_cost, APIQuotaMap.lease_duration_sec)
+                .where(APIQuotaMap.feature == feature)
+            ).one_or_none()
+            if configuration is None:
                 raise QuotaNotConfigured("Schedule-search feature is not configured")
-    if operation is not None and operation.status == FeatureQuotaStatus.RESERVED:
+            unit_cost, lease_duration = configuration
+            # Lookup is only a fast path; atomic insertion still fences racing keys.
+            operation = _reserve_quota_in_transaction(
+                session,
+                org_id=org_id,
+                feature=feature,
+                units=len(request.routes) * unit_cost,
+                idempotency_key=idempotency_key,
+                lease_duration=lease_duration,
+                request_payload=request_payload,
+                reject_pending_replay=True,
+            )
+            # Fresh work is durable only after exiting this transaction.
+    if not fresh and operation.status == FeatureQuotaStatus.RESERVED:
         claims = claim_expired_reservations(
             session, feature=feature, operation_id=operation.id, limit=1
         )
         if not claims:
             raise OperationConflict("Operation is in progress; retry later")
         operation = claims[0]
-    elif operation is None:
-        # This lookup is only a replay fast path. Atomic key claiming in reserve_quota
-        # still protects concurrent new requests that both observed no existing row.
-        operation = reserve_quota(
-            session,
-            org_id=org_id,
-            feature=feature,
-            units=len(request.routes) * unit_cost,
-            idempotency_key=idempotency_key,
-            request_payload=request_payload,
-            reject_pending_replay=True,
-        )
-    return execute_schedule_operation(session, operation)
+    return operation
 
 
 def execute_schedule_operation(
@@ -111,11 +134,15 @@ def execute_schedule_operation(
         except DemoFeatureFailure:
             # Only known failures are refunded. Database errors/unknown commits
             # are not evidence of failed execution and must not trigger a refund.
-            release_reservation(
+            time_quota(
+                "quota_release",
+                release_reservation,
                 session, operation_id=operation.id, claim_version=operation.claim_version
             )
             raise
-        operation = finalize_reservation(
+        operation = time_quota(
+            "quota_finalize",
+            finalize_reservation,
             session,
             operation_id=operation.id,
             claim_version=operation.claim_version,

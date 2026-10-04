@@ -218,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 assignment/
+
+# Local load fixtures and raw output; curate measured results separately.
+/benchmarks/results/

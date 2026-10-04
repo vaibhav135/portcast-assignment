@@ -155,113 +155,146 @@ def reserve_quota(
         if lease_duration is None:
             raise ValueError(f"No quota configuration for feature {feature}")
 
-        # Claim identity before capacity. PostgreSQL waits on an uncommitted
-        # duplicate, so only the winning transaction can acquire units.
-        operation = session.scalar(
-            insert(QuotaUsagePerRequest)
-            .values(
-                org_id=org_id,
-                feature=feature,
-                status=FeatureQuotaStatus.RESERVED,
-                # Provisional allocation claims the key. The actual split is
-                # recorded below before commit; no other transaction sees this.
-                used_from_monthly=units,
-                used_from_extra=0,
-                idempotency_key=idempotency_key,
-                request_payload=request_payload,
-                reserved_at=func.clock_timestamp(),
-                lease_expires_at=func.clock_timestamp()
-                + timedelta(seconds=lease_duration),
-            )
-            .on_conflict_do_nothing(constraint="uq_operation_key")
-            .returning(QuotaUsagePerRequest)
+        return _reserve_quota_in_transaction(
+            session,
+            org_id=org_id,
+            feature=feature,
+            units=units,
+            idempotency_key=idempotency_key,
+            lease_duration=lease_duration,
+            request_payload=request_payload,
+            reject_pending_replay=reject_pending_replay,
         )
-        if operation is None:
-            existing = session.scalar(
-                select(QuotaUsagePerRequest)
-                .where(
-                    QuotaUsagePerRequest.org_id == org_id,
-                    QuotaUsagePerRequest.feature == feature,
-                    QuotaUsagePerRequest.idempotency_key == idempotency_key,
-                )
-                .execution_options(populate_existing=True)
-            )
-            if existing is None:
-                raise RuntimeError("Conflicting operation disappeared during replay")
-            if existing.used_from_monthly + existing.used_from_extra != units:
-                raise IdempotencyConflict("Operation key already used with different units")
-            if existing.request_payload != request_payload:
-                raise IdempotencyConflict("Operation key already used with different inputs")
-            if reject_pending_replay and existing.status == FeatureQuotaStatus.RESERVED:
-                raise OperationConflict("Operation is in progress; retry later")
-            session.expunge(existing)
-            return existing
 
-        # Hold the monthly row while determining the split. All accounting paths
-        # acquire locks in operation -> monthly -> credits order.
-        monthly_quota = session.scalar(
-            select(FeatureQuotaMonthly)
+
+def _reserve_quota_in_transaction(
+    session: Session,
+    *,
+    org_id: int,
+    feature: APIFeature,
+    units: int,
+    idempotency_key: UUID,
+    lease_duration: int,
+    request_payload: dict | None = None,
+    reject_pending_replay: bool = False,
+) -> QuotaUsagePerRequest:
+    """Internal admission primitive; caller owns commit/rollback and configuration.
+
+    Return a detached snapshot, but it is not durable until the caller commits.
+    Never execute feature work while this admission transaction is still open.
+    """
+    if not session.in_transaction():
+        raise RuntimeError("Reservation requires an active transaction")
+    if units <= 0:
+        raise ValueError("Reservation units must be positive")
+    if lease_duration <= 0:
+        raise ValueError("Reservation lease duration must be positive")
+
+    # Claim identity before capacity. PostgreSQL waits on an uncommitted
+    # duplicate, so only the winning transaction can acquire units.
+    operation = session.scalar(
+        insert(QuotaUsagePerRequest)
+        .values(
+            org_id=org_id,
+            feature=feature,
+            status=FeatureQuotaStatus.RESERVED,
+            # Provisional allocation claims the key. The actual split is
+            # recorded below before commit; no other transaction sees this.
+            used_from_monthly=units,
+            used_from_extra=0,
+            idempotency_key=idempotency_key,
+            request_payload=request_payload,
+            reserved_at=func.clock_timestamp(),
+            lease_expires_at=func.clock_timestamp() + timedelta(seconds=lease_duration),
+        )
+        .on_conflict_do_nothing(constraint="uq_operation_key")
+        .returning(QuotaUsagePerRequest)
+    )
+    if operation is None:
+        existing = session.scalar(
+            select(QuotaUsagePerRequest)
+            .where(
+                QuotaUsagePerRequest.org_id == org_id,
+                QuotaUsagePerRequest.feature == feature,
+                QuotaUsagePerRequest.idempotency_key == idempotency_key,
+            )
+            .execution_options(populate_existing=True)
+        )
+        if existing is None:
+            raise RuntimeError("Conflicting operation disappeared during replay")
+        if existing.used_from_monthly + existing.used_from_extra != units:
+            raise IdempotencyConflict("Operation key already used with different units")
+        if existing.request_payload != request_payload:
+            raise IdempotencyConflict("Operation key already used with different inputs")
+        if reject_pending_replay and existing.status == FeatureQuotaStatus.RESERVED:
+            raise OperationConflict("Operation is in progress; retry later")
+        session.expunge(existing)
+        return existing
+
+    # Hold the monthly row while determining the split. All accounting paths
+    # acquire locks in operation -> monthly -> credits order.
+    monthly_quota = session.scalar(
+        select(FeatureQuotaMonthly)
+        .where(
+            FeatureQuotaMonthly.org_id == org_id,
+            FeatureQuotaMonthly.feature == feature,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+    if monthly_quota is None:
+        raise InsufficientQuota("Monthly quota is not configured")
+    admitted_at = _refresh_monthly_quota(session, monthly_quota)
+    # Assign the original admission time only once, before its first commit.
+    # Key/row-lock waits must not assign an old period or an already-expired lease.
+    operation.reserved_at = admitted_at
+    operation.lease_expires_at = admitted_at + timedelta(seconds=lease_duration)
+    monthly_units = min(monthly_quota.units_remaining, units)
+    credit_units = units - monthly_units
+
+    if monthly_units:
+        acquired = session.scalar(
+            update(FeatureQuotaMonthly)
             .where(
                 FeatureQuotaMonthly.org_id == org_id,
                 FeatureQuotaMonthly.feature == feature,
+                FeatureQuotaMonthly.units_remaining >= monthly_units,
             )
-            .with_for_update()
-            .execution_options(populate_existing=True)
+            .values(
+                units_consumed=FeatureQuotaMonthly.units_consumed + monthly_units,
+                units_remaining=FeatureQuotaMonthly.units_remaining - monthly_units,
+            )
+            .returning(FeatureQuotaMonthly.id)
+            .execution_options(synchronize_session=False)
         )
-        if monthly_quota is None:
-            raise InsufficientQuota("Monthly quota is not configured")
-        admitted_at = _refresh_monthly_quota(session, monthly_quota)
-        # Assign the original admission time only once, before its first commit.
-        # Key/row-lock waits must not assign an old period or an already-expired lease.
-        operation.reserved_at = admitted_at
-        operation.lease_expires_at = admitted_at + timedelta(seconds=lease_duration)
-        monthly_units = min(monthly_quota.units_remaining, units)
-        credit_units = units - monthly_units
+        if acquired is None:
+            raise RuntimeError("Locked monthly balance changed unexpectedly")
 
-        if monthly_units:
-            acquired = session.scalar(
-                update(FeatureQuotaMonthly)
-                .where(
-                    FeatureQuotaMonthly.org_id == org_id,
-                    FeatureQuotaMonthly.feature == feature,
-                    FeatureQuotaMonthly.units_remaining >= monthly_units,
-                )
-                .values(
-                    units_consumed=FeatureQuotaMonthly.units_consumed + monthly_units,
-                    units_remaining=FeatureQuotaMonthly.units_remaining - monthly_units,
-                )
-                .returning(FeatureQuotaMonthly.id)
-                .execution_options(synchronize_session=False)
+    if credit_units:
+        acquired = session.scalar(
+            update(FeatureQuotaExtra)
+            .where(
+                FeatureQuotaExtra.org_id == org_id,
+                FeatureQuotaExtra.feature == feature,
+                FeatureQuotaExtra.units_remaining >= credit_units,
+                FeatureQuotaExtra.expires_on > func.clock_timestamp(),
             )
-            if acquired is None:
-                raise RuntimeError("Locked monthly balance changed unexpectedly")
-
-        if credit_units:
-            acquired = session.scalar(
-                update(FeatureQuotaExtra)
-                .where(
-                    FeatureQuotaExtra.org_id == org_id,
-                    FeatureQuotaExtra.feature == feature,
-                    FeatureQuotaExtra.units_remaining >= credit_units,
-                    FeatureQuotaExtra.expires_on > func.clock_timestamp(),
-                )
-                .values(
-                    units_consumed=FeatureQuotaExtra.units_consumed + credit_units,
-                    units_remaining=FeatureQuotaExtra.units_remaining - credit_units,
-                )
-                .returning(FeatureQuotaExtra.id)
-                .execution_options(synchronize_session=False)
+            .values(
+                units_consumed=FeatureQuotaExtra.units_consumed + credit_units,
+                units_remaining=FeatureQuotaExtra.units_remaining - credit_units,
             )
-            if acquired is None:
-                # This exception rolls back the monthly deduction and key claim too.
-                raise InsufficientQuota("Combined allowance and usable credits are insufficient")
+            .returning(FeatureQuotaExtra.id)
+            .execution_options(synchronize_session=False)
+        )
+        if acquired is None:
+            # The caller must roll back the monthly deduction and key claim too.
+            raise InsufficientQuota("Combined allowance and usable credits are insufficient")
 
-        operation.used_from_monthly = monthly_units
-        operation.used_from_extra = credit_units
-        session.flush()
-        # Keep the returned snapshot readable even with expire_on_commit=True.
-        session.expunge(operation)
-
+    operation.used_from_monthly = monthly_units
+    operation.used_from_extra = credit_units
+    session.flush()
+    # Keep the returned snapshot readable even with expire_on_commit=True.
+    session.expunge(operation)
     return operation
 
 

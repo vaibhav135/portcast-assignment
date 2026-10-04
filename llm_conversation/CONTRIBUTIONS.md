@@ -297,3 +297,150 @@ These are collaborative outcomes, not exclusively human- or AI-originated:
 - For submission, produce a concise AI-assistance disclosure based on this record:
   identify AI-written code/tests/docs, the author's policy/schema contributions,
   joint decisions, and verification/limitations honestly.
+
+## 7. Benchmark investigation, experiments, and cleanup
+
+- Recovery `1fbdb16` and runtime `9f4b160` were merged and subsequently pushed to
+  `origin/main` on the author's explicit request. The benchmark work began on
+  `test/quota-load`; the chronological checkpoints below precede the later
+  author-requested checkpoint commit/push.
+- The author requested an Internet-backed comparison of load tools and approved
+  k6. The assistant wrote k6 workloads, isolated fixture/reconciliation tooling,
+  opt-in timing headers, tests, and documentation. Test fixtures use `portcast_load`
+  and the suite uses `portcast_test`; the original demo database was preserved.
+- Preliminary serial profiling and compilation-cache checks did not establish a
+  complete root cause. The local 2,000/sec, 60s experiment missed the targets:
+  3,493 completed requests, approximately 52.9/sec including drain, and 116,507
+  scheduled iterations not started. A 50-VU comparison also missed the targets.
+  Accounting reconciled, but these are not successful performance demonstrations.
+- The author explicitly challenged the broad investigation and directed atomic
+  measurements of one actual endpoint with few users. The assistant implemented
+  `src/consumer/tracing.py` and `scripts/trace_quota.py`: per-request nested wall/
+  valid sync-thread CPU spans, client/server IDs, and read-only PostgreSQL waits.
+  This did not change the quota SQL, transaction policy, or accounting algorithm.
+- The bounded diagnostic was exactly 20 requests with five concurrent users.
+  Review caught a CPU end-clock ordering bug in the instrumentation; the assistant
+  corrected it, added a regression test, and repeated the same bounded workload
+  with fresh fixtures. Use `atomic20-v2-*` as the corrected evidence, not the first
+  CPU breakdown. Both runs settled and charged exactly 20 units each.
+- Corrected traces reconstruct every request's wall time using exclusive intervals,
+  without double-counting children. They locate ORM/SQL-client work, request
+  dispatch/response time, connection/ping, and commits; snapshots can miss short
+  DB waits and client SQL wall time is not server execution time. Instrumentation
+  and cold-start effects prevent treating these as uninstrumented production
+  latency or proof about the earlier high-concurrency failure.
+- Latest full suite: **86 passed** against PostgreSQL, with the existing TestClient
+  deprecation warning. No performance optimization has been applied. Contract/grace
+  enforcement, fresh-result reuse, final design/results curation, and cleanup
+  remain pending. Temporary `TODO.md` and raw local result files are not staged.
+- After the author requested a simpler diagnostic, the assistant added isolated
+  `scripts/simple_quota_timing.py` and sent one curl request, then (with separate
+  approval) one more request using public Psycopg protocol tracing and commit-only
+  standard-library profiling. No library files or quota implementation were edited.
+  The first write commit took 43.093 ms; the profiled repeat took 29.528 ms, with
+  29.418 ms between COMMIT and final-response protocol entries. This locates the
+  interval but does not diagnose server WAL, network, or scheduling as its cause.
+  Diagnostic containers were stopped and their logs retained. The later standalone
+  diagnostic was smoke-checked by its HTTP requests, not included in the earlier
+  86-test result. External research and measurement caveats are preserved locally
+  in `benchmarks/results/simple-commit-investigation.md`; no tuning was performed.
+- On separate approval to go deeper, the assistant enabled session-only server
+  duration logging and sampled the named diagnostic backend during one additional
+  request (operation 7193, PID 38514). The client reservation commit was 39.945 ms,
+  PostgreSQL reported 38.533 ms, and six active-COMMIT samples reported IO/WalSync.
+  This establishes a server WAL durability wait for that slow commit, not the
+  cause of every API delay or the earlier throughput failure. Host versus VM
+  clock-offset and sampling caveats are recorded in the local evidence. No global
+  PostgreSQL settings, accounting policy, durability, or library files were changed.
+  The diagnostic server was stopped after the request; no further tests were run.
+- The author then approved PostgreSQL's official `pg_test_fsync` storage diagnostic
+  (one second per test, unique scratch file on the WAL filesystem). Current
+  fdatasync averaged 0.543ms for one 8kB write and 0.605ms for two, fastest among
+  tested methods in those cases. The utility completed and scratch-file removal
+  was verified. This does not explain earlier slow-tail commits or establish API
+  throughput; no configuration or durability change was made.
+- The author approved exactly three sequential fresh-key requests on one newly
+  started diagnostic server. With commit profiling off, first admission took
+  63.456ms and the next two 27.432/29.061ms. Server reservation commits were
+  3.484/1.418/1.518ms; the earlier 30–40ms stall did not recur, including on the
+  first request. Warm admission still exceeded 10ms, with cumulative SQL/client
+  work larger than commit. The assistant recorded this limited comparison and
+  stopped the server; no optimization or broader test followed.
+- The author then explicitly approved consolidating preliminary checks and fresh
+  reservation into one transaction and reading price/lease once, without changing
+  architecture. The assistant extracted a private transaction-scoped reservation
+  helper while retaining the public transaction-owning API, updated the consumer,
+  diagnostic labels, and existing tests, and added six PostgreSQL regressions for
+  one commit/config read, rollback, and independent-session admission races.
+  **92 tests passed**. Three approved curl comparisons observed warm admission
+  23.538/23.495ms versus 27.432/29.061ms previously (~16.7% lower two-sample mean),
+  with logging on; not a production percentile or proof of meeting 10ms. Fixture
+  accounting reconciled nine total DONE units and no holds. The server was stopped;
+  no further optimization, sustained test, commit, or push was performed.
+- A Core endpoint probe was subsequently started, then paused during scope
+  clarification. `scripts/core_quota_probe.py`, its tests, and an optional diagnostic
+  selection flag remain unverified; no Core curl comparison or tests were run.
+- After explicit clarification to think small and compare transactions in one
+  standalone file, the assistant added `scripts/asyncpg_quota_probe.py`: three
+  current ORM calls and three direct asyncpg calls for only fresh monthly-funded
+  work, on reused connections, with commit included and settlement outside timing.
+  asyncpg 0.31.0 was installed only in the disposable diagnostic environment;
+  application/dependency files were unchanged. Warm two-call means were 19.491ms
+  ORM versus 9.421ms asyncpg (~52% observed reduction), not a driver-only attribution
+  or production SLO claim. Six DONE units/no holds reconciled. Scope, fixed-order,
+  logging/checkout exclusions, and raw results are recorded in local
+  `benchmarks/results/asyncpg-probe-report.md`. The probe exited; no endpoint switch,
+  further experiment, commit, or push followed.
+- On separate approval, the assistant made the standalone probe compare automatic
+  asyncpg caching against explicit handles for the identical seven statements.
+  Three calls each observed warm means 8.872ms automatic versus 9.656ms explicit;
+  preparation cost 5.968ms outside the timer. This tiny fixed-order comparison
+  showed no benefit and does not establish a regression or production percentile.
+  All six fixture operations settled/reconciled. Application and schema unchanged;
+  probe exited. Local evidence: `benchmarks/results/asyncpg-prepared-report.md`.
+- The author separately approved measuring SQLAlchemy Async ORM with asyncpg using
+  `AsyncSession.run_sync()` to reuse existing admission unchanged. The assistant
+  added only a standalone-probe branch and temporarily installed SQLAlchemy's
+  asyncio extra in its test container. Three calls each: direct asyncpg warm mean
+  9.273ms; ORM/asyncpg bridge 20.020ms. All six operations reconciled as DONE with
+  no holds, and the probe exited. This does not assign all overhead to ORM objects
+  or establish native-async/production performance. No endpoint/schema/dependency
+  files changed. Local evidence: `benchmarks/results/async-orm-report.md`.
+- The author approved a PostgreSQL-function comparison. The assistant added a
+  session-local pg_temp PL/pgSQL function for the same limited fresh monthly path,
+  with no production migration. In one three-call comparison, direct asyncpg warm
+  mean was 11.269ms versus 5.320ms via one function call; creation was 4.034ms outside
+  timing. Fixed order, warmed connection and limited scope prevent production/cold
+  latency claims. Six DONE units reconciled, no holds; a catalog check after close
+  confirmed the temporary function was gone. The optional async-ORM imports were
+  made lazy after a pre-transaction launch failure. No application integration or
+  further test was performed. Local evidence: `benchmarks/results/postgres-function-report.md`.
+- On explicit cleanup approval, the standalone transaction probe was moved from
+  `scripts/asyncpg_quota_probe.py` to `tests/experiments/asyncpg_quota_probe.py`.
+  The unfinished Core probe/test and its diagnostic selection flag were removed.
+  Manual experiment instructions preserve invocation, scope and measured results;
+  historical raw records were not rewritten. k6, fixture tooling, older profiling/
+  tracing, database fixtures and retained results were left unchanged for separate
+  review. No alternative admission path was adopted into the application.
+  Verification after cleanup: **92 tests passed** against `portcast_test`, with
+  only the existing TestClient deprecation warning; `git diff --check` passed.
+  No probe transactions, HTTP calls, load tests, commits, or pushes were run.
+- On separate approval, the assistant removed detailed consumer tracing middleware,
+  lifecycle/ORM/SQL hooks and markers, retired the serial profiler and trace analyzer,
+  and removed their 22 feature/tool-specific tests. Business accounting and its
+  correctness tests were retained. Minimal opt-in Server-Timing now calls quota
+  functions directly without a tracing dependency; k6's retired trace-ID feature
+  was removed while quota timing/checks remain. The simple timing launcher moved
+  to `tests/experiments/`; docs preserve findings but no longer instruct running
+  deleted tools. **70 retained tests passed** with the existing TestClient warning;
+  `git diff --check` and a network-disabled `k6 inspect` check passed. No performance
+  experiment, application integration, durability change, commit, or push followed.
+- After reviewing the original PDF, the author chose submission-focused scope:
+  retain the tested SQLAlchemy implementation, document unmet targets and possible
+  improvements, and defer optional contract/fresh-result-reuse extensions. The
+  temporary TODO was corrected accordingly. The author then explicitly requested
+  a checkpoint commit and push of the retained application, benchmark tooling,
+  isolated experiments, tests and documentation before deciding on further work.
+  Raw local results, temporary planning, secrets and browser artifacts are excluded.
+  DESIGN.md and final runtime/load verification remain outstanding; this checkpoint
+  is not a completed submission or a claim of meeting the performance objectives.
