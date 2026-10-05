@@ -197,6 +197,15 @@ would require those cases to pass and the actual request path to be measured.
 [Manual probes](tests/experiments/README.md) preserve that evidence; detailed
 tracing/older profilers were removed, minimal opt-in quota timing remains.
 
+**Verification choice:** After consolidating admission, I checked correctness
+with the retained test suite and used bounded curl/transaction comparisons to
+measure the change and investigate latency reductions. Within the remaining
+timebox, I prioritized verified accounting and targeted performance evidence
+over repeating a sustained/peak campaign or integrating incomplete alternatives.
+The earlier k6 runs therefore do not measure the consolidated, cleaned version;
+its sustained/peak capacity remains unmeasured. A future integrated optimization
+would need both contract revalidation and a new full-path load test.
+
 ## 7. Scaling and alternatives
 
 50,000 organizations × roughly 30 features means about 1.5 million active quota
@@ -243,8 +252,9 @@ load, history growth and write contention instead of assuming one scaling remedy
 ## 8. Limits and authorship
 
 Org IDs are not authentication. No carrier integration, delivery guarantee, purge
-or HA deployment is supplied. Runtime smoke checks predate cleanup; final cleaned-source
-runtime/load verification remains outstanding.
+or HA deployment is supplied. Earlier Compose startup, restart and runtime smoke
+checks passed, but were not repeated after instrumentation cleanup. That final
+container smoke check is release verification, separate from a new load-test campaign.
 
 The author drew the original architecture/schema sketches and chose the product
 policies and scope. Implementation, tests, experiments and this draft received
