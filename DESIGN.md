@@ -9,20 +9,18 @@ reset, reporting and recovery for one pure schedule consumer.
 The brief targets 2,000 quota operations/sec sustained, 10,000/sec peak and under
 10ms request-path check/deduction overhead.
 
-**Tested correctness, with a measured path to lower latency.** The retained suite
-passed 70 tests against real PostgreSQL. We tested the implemented ORM-based
-consumer under per-organization load, then compared the same fresh monthly-quota
-transaction using lighter access paths: warm admission averaged 19.49ms with
-ORM/Psycopg versus 9.42ms with direct asyncpg. A separate comparison reduced
-11.27ms to 5.32ms by executing admission inside PostgreSQL.
+**70 retained tests passed against real PostgreSQL.**
 
-With the functional path already implemented, we used the remaining assignment
-time to demonstrate and understand these reductions rather than attempt a late
-refactor of all concurrency, retry, credit, reset and recovery cases. Retaining
-SQLAlchemy was a deliberate scope decision, not an assumption that it was already
-fast enough. These limited transaction results establish promising directions,
-not integrated-API latency or sustained/peak capacity; the measured limits and
-next steps are recorded below. Commands are in [README.md](README.md).
+The retained implementation prioritizes verified accounting correctness within
+the take-home timebox and does not meet the latency target in the recorded
+measurements. The transaction comparisons showed meaningful optimization headroom
+without replacing PostgreSQL: direct asyncpg measured approximately 9.4ms for
+fresh admission, while a separate PostgreSQL-function comparison measured
+approximately 5.3ms. These were limited fresh-monthly transaction measurements,
+not integrated request-path or throughput guarantees. I chose not to integrate
+either approach late in the exercise because doing so would require revalidating
+the full concurrency, idempotency, refund, reset, credit, and recovery contract.
+Commands are in [README.md](README.md).
 
 ## 2. Architecture and data model
 
@@ -39,8 +37,11 @@ does not refill quotas. No broker or quota HTTP service is needed.
 
 ![Author's original architecture sketch showing shared PostgreSQL, API instances and recovery](assets/Screenshot%202026-10-05%20at%204.25.02%E2%80%AFAM.png)
 
-*Figure 1 — Architecture drawn by the author, included unchanged. LB/cache/external
-services are conceptual; implemented recovery uses ownership leases, not execution deadlines.*
+*Figure 1 — Early architecture sketch drawn by the author and used during design,
+included unchanged. The final implementation uses the shared-library/PostgreSQL
+shape described in this section. Cache and external-service paths are conceptual
+and are not part of quota correctness; the demo does not deploy a load balancer.
+Recovery eligibility uses ownership leases, not an execution-timeout guarantee.*
 
 | Table | Responsibility |
 |---|---|
@@ -55,8 +56,11 @@ as one). Configuration lives in PostgreSQL, not per-instance counters.
 
 ![Author's original quota schema sketch with per-organization feature balances and reservation states](assets/Screenshot%202026-10-05%20at%204.24.56%E2%80%AFAM.png)
 
-*Figure 2 — Schema drawn by the author, included unchanged. Request/result JSONB
-was added during implementation. Contract-linked credit expiry remains a deferred policy.*
+*Figure 2 — Early logical schema sketch drawn by the author, included unchanged.
+The implemented tables retain this accounting shape and add request/result JSONB
+for retry identity and saved outcomes. Contract-linked credit retention is a
+designed extension, not an implemented eligibility/lifecycle policy. Success is
+charged at durable result finalization, not verified request/response delivery.*
 
 ### Designed extensions, deferred
 
@@ -195,18 +199,46 @@ tracing/older profilers were removed, minimal opt-in quota timing remains.
 
 ## 7. Scaling and alternatives
 
-50,000 orgs × 30 features can mean 1.5 million monthly rows; operation history grows
-with traffic. Before claiming that scale:
+50,000 organizations × roughly 30 features means about 1.5 million active quota
+buckets. That alone is not a reason to replace an indexed PostgreSQL design. I
+would focus on operation rate, contention within individual buckets, connection
+pressure, and growth of request history. The following is my evolution plan,
+not functionality already implemented or capacity already demonstrated.
 
-- Reduce round trips/ORM work, validate the **full** contract and measure the
-  integrated path. Experiments suggest directions, not ready replacements.
-- Budget connections across replicas; hot buckets still serialize. Batching,
-  capacity leasing or sharding must preserve the shared limit.
-- Add measured reporting indexes and terminal-operation retention preserving retry
-  identity/unresolved holds. Extending the demo's two enum features needs migrations.
-- Test realistic storage, mixed traffic, failover and recovery lag. Do not weaken
-  `fsync` or refund unknown outcomes to hide delays. Redis-authoritative accounting
-  needs durability/reconciliation design, not just caching.
+- **Optimize the existing path first.** Reduce ORM processing and database round
+  trips through explicit SQL/asyncpg, potentially collapsing admission into a
+  PostgreSQL function. Our experiments support this direction without replacing
+  the shared-state correctness model; the complete accounting contract still
+  needs revalidation before integration.
+- **Bound connections as replicas grow.** PgBouncer can let many application
+  connections share a bounded server pool. It addresses connection pressure, not
+  WAL, CPU, I/O or lock contention. Pooling mode and prepared-statement compatibility
+  need checking when using asyncpg.
+- **Offload only appropriate reads.** Replicas can serve historical, admin/dashboard
+  and other stale-tolerant reads, leaving primary capacity for writes. Admission
+  must use primary state. Our current usage endpoint also performs locked lazy
+  reset, so it cannot move unchanged to a read-only replica.
+- **Cache data with explicit freshness rules.** Configuration, metadata and
+  stale-tolerant reports are candidates; pricing/limit changes need invalidation
+  or versioning. Remaining quota stays authoritative in PostgreSQL. Redis-authoritative
+  consumption would introduce different durability/failover semantics. Replicate
+  or cluster a cache only when its CPU, memory, network, connections or availability
+  requirements justify it—not because the organization count reaches 50,000.
+- **Keep request history bounded.** Aggregates grow with organizations × features;
+  operations/idempotency grow with requests × time. Define terminal-record retention
+  and the retry window, archive old history, and consider time partitioning as needed.
+  Never silently erase retry protection or purge unresolved reservations.
+- **Separate total throughput from hot-key limits.** Independent buckets can run
+  concurrently; thousands of requests for one organization/feature/period still
+  contend on one logical value. More API instances, pooling, replicas and ordinary
+  sharding do not remove that serialization. If an optimized primary eventually
+  becomes the aggregate-write bottleneck, `org_id` is a natural sharding boundary;
+  spreading organizations does not split a single hot bucket.
+
+Measurements should choose the next step: quota p95/p99, database CPU/I/O, pool
+waits, active connections, row-lock waits, WAL/write pressure, table/index size
+and per-key contention. Those distinguish SQL overhead, connection limits, read
+load, history growth and write contention instead of assuming one scaling remedy.
 
 ## 8. Limits and authorship
 

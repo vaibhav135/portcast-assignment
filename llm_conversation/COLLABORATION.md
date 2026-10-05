@@ -20,6 +20,9 @@ substantial implementation, tests, tooling and documentation were AI-written.
   overextended investigation toward small, explicit transaction comparisons.
 - Chose to retain the tested SQLAlchemy implementation and document measured
   optimization directions rather than undertake a late partial migration.
+- Supplied the measurement-driven scaling direction: optimize PostgreSQL first,
+  then address connections, safe read offload, caching, retention and hot-bucket
+  limits before considering sharding.
 - Selected broader contract/grace/credit-retention and fresh-result-reuse policies;
   these remain deferred extensions, not claims of implemented assignment functionality.
 
